@@ -1,4 +1,4 @@
-# RTX 4060 and RTX 5070 Laptop GPU benchmarks
+# Inkling 2 Mini on the RTX 4060 Laptop GPU
 
 Windows · 8 GB RTX 4060 Laptop GPU · Core i7-13700H · 32 GB RAM
 
@@ -142,14 +142,3 @@ Invoke-RestMethod http://127.0.0.1:18771/v1/chat/completions -Method Post -Conte
 </details>
 
 The measured scenarios cover cold prefill and generation with one text request at a time.
-
-## RTX 5070 Laptop GPU
-
-A local build with Q4_0 KV retrieved all three records in every run.
-
-| Window | Prefill chunk (tokens) | Prefill (tok/s) | Generation (tok/s) |
-| ---: | ---: | ---: | ---: |
-| 64K | 1,536 | 655.6 | 19.9 |
-| 64K | 2,560 | 903.1 | 20.1 |
-| 128K | 1,536 | 488.7 | 15.4 |
-| 128K | 2,560 | 613.0 | 16.4 |
