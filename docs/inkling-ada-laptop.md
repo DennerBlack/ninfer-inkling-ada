@@ -2,7 +2,7 @@
 
 Windows · 8 GB RTX 4060 Laptop GPU · Core i7-13700H · 32 GB RAM
 
-One text request at a time. The model is Inkling 2 Mini UD-IQ4_XS, with routed experts in pinned host RAM and their hot weights in a GPU cache. The build and model artifact were held fixed throughout.
+One text request at a time. The model is Inkling 2 Mini UD-IQ4_XS, with routed experts in pinned host RAM and their hot weights in a GPU cache. Both windows used the same build and the same locally converted model file. [Exact model revision and SHA-256](inkling-ada-benchmarks.md#exact-model-files)
 
 ## 64K and 128K with Q4_0 KV
 
@@ -15,7 +15,7 @@ Each run asked the model to retrieve three exact record values placed near 10%, 
 | 131,072 | 1,536 | 124,065 | 379.7 tok/s | 12.0 tok/s | 5m 26.8s | 3/3 |
 | 131,072 | 2,560 | 124,065 | 453.0 tok/s | 14.3 tok/s | 4m 34.0s | 3/3 |
 
-The 2,560-token rows use tiled Q4_0 decode. All four requests returned the same three values in the same order. Total generation length, including reasoning, changed from 210 to 189 tokens at 64K and from 240 to 157 at 128K. The headroom figures below come from the engine capacity log. Pinned expert sources occupied 13,385 MiB in each run.
+The 2,560-token rows use tiled Q4_0 decode. All four requests returned the same three values in the same order. Total generation length, including reasoning, changed from 210 to 189 tokens at 64K and from 240 to 157 at 128K. Pinned expert sources occupied 13,385 MiB in each run.
 
 ## Settings sweep
 
@@ -86,7 +86,7 @@ Run the server with one profile at a time. The Windows expert-cache ceiling stay
 The larger chunk improves long requests. The 1,536-token chunk gave slightly higher generation rates on the short prompt, 21.6 versus 21.2 tok/s at 64K and 19.0 versus 18.8 at 128K.
 
 ```powershell
-$weights = 'C:\models\Inkling-2-Mini-UD-IQ4_XS.ninfer'
+$weights = 'C:\models\Inkling-2-Mini-UD-IQ4_XS-visionq8.ninfer'
 $window = 65536
 $cache = 1600
 # For 128K, set $window to 131072 and $cache to 1024.

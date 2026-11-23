@@ -1,41 +1,60 @@
-<h1 align="center">NInfer · Inkling Ada</h1>
-
 <p align="center">
-  Inkling 2 Mini with a 256K context on a single 16 GB RTX 4080 SUPER.
+  <img src="docs/assets/inkling-ada-hero.png" alt="Inkling Ada · NInfer for GeForce RTX. Q4_0 KV and hot experts on the GPU, pinned routed experts in host RAM." width="100%">
 </p>
 
 <p align="center">
-  <a href="#benchmarks">Benchmarks</a> · <a href="#quick-start">Quick start</a> · <a href="#implementation">Implementation</a>
+  <strong>Inkling 2 Mini on one Ada GPU.</strong>
+  256K on the 16 GB RTX 4080 SUPER and up to 128K on the 8 GB RTX 4060 Laptop GPU.
+</p>
+
+<p align="center">
+  <a href="#benchmarks">Benchmarks</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#implementation">Implementation</a> ·
+  <a href="https://github.com/DennerBlack/ninfer-inkling-ada/releases">Releases</a>
 </p>
 
 ## Benchmarks
 
-Windows · RTX 4080 SUPER 16 GB · Core i7-12700F · 64 GB RAM
+All timed profiles used **Inkling 2 Mini UD-IQ4_XS**, one slot and Q4_0 full-attention KV on the GPU. The desktop profiles use the same two text requests. The laptop tests retrieve three exact records. [Methodology and weight hashes](docs/inkling-ada-benchmarks.md)
 
-| Input tokens | Prefill | Generation | First token |
-| ---: | ---: | ---: | ---: |
-| 9,700 | 2,140 tok/s | **79.2 tok/s** | 4.6 s |
-| 56,456 | 2,110 tok/s | **65.3 tok/s** | 26.8 s |
+### RTX 4080 SUPER · 16 GB
+
+![Inkling Ada and the llama.cpp banded test build on RTX 4080 SUPER at 256K Q4_0 KV. The folded table contains the full data.](docs/assets/inkling-ada-desktop.png)
 
 <details>
-<summary>Test settings</summary>
+<summary>Results and test settings</summary>
 
-One slot with a GPU KV cache sized for 262,144 tokens. The timed text requests had zero prefix-cache hits and generated 320 tokens each. Prefill chunks were 3,072 tokens. DSpark used two draft tokens and n-gram lookup.
+| Engine | KV capacity, tokens | Input tokens | Prefill, tok/s | Generation, tok/s | TTFT, s |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| Inkling Ada | 262,144 | 9,700 | 2,140.0 | 79.2 | 4.6 |
+| llama.cpp banded | 262,144 | 9,700 | 438.2 | 13.6 | 22.4 |
+| Inkling Ada | 262,144 | 56,456 | 2,110.0 | 65.3 | 26.9 |
+| llama.cpp banded | 262,144 | 56,456 | 394.9 | 11.4 | 143.4 |
 
-The Q4_0 GPU KV allocation was 3,035 MiB. The GPU expert cache held 5,662 MiB, and pinned host expert weights took about 13.1 GiB. The timed runs used CUDA 13.3 and a locally packed UD-IQ4_XS artifact.
+Windows · Core i7-12700F · 64 GB RAM · 3,072-token prefill chunks. Each run generated 320 tokens with zero prefix-cache hits. Both builds enabled DSpark with up to two proposals and three-token n-gram lookup. [Exact configurations](docs/inkling-ada-benchmarks.md#desktop-engine-comparison)
 
 </details>
 
+The chart pairs the original Inkling Ada measurements with a run of a locally patched llama.cpp banded build. Both completed the same workloads at 256K Q4_0 full-attention KV. Sliding-window KV precision, GPU expert cache size and DSpark acceptance settings differed.
+
+On this system, released llama.cpp allocated the requested KV before hitting the Windows commit guard during startup. NInfer-all rejected Q4_0, and Strata selected FP8 with a 37,184-token window. [Engine versions and launch results](docs/inkling-ada-benchmarks.md#desktop-engine-comparison)
+
 ### RTX 4060 Laptop GPU · 8 GB
 
-One text request at a time with Q4_0 KV, staged host experts, and a 2,560-token prefill chunk.
+![RTX 4060 Laptop GPU at 64K and 128K Q4_0 KV. Near the window limits, generation reached 17.8 and 14.3 tok/s.](docs/assets/inkling-ada-laptop.png)
 
-| Context window | Input tokens | Prefill | Generation | First token |
-| ---: | ---: | ---: | ---: | ---: |
-| 65,536 | 61,265 | 683.2 tok/s | **17.8 tok/s** | 1m 29.7s |
-| 131,072 | 124,065 | 453.0 tok/s | **14.3 tok/s** | 4m 34.0s |
+<details>
+<summary>Results and test settings</summary>
 
-[Laptop benchmark and launch settings](docs/inkling-ada-laptop.md)
+| Engine | KV capacity, tokens | Input tokens | Prefill, tok/s | Generation, tok/s | TTFT, s |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| Inkling Ada | 65,536 | 61,265 | 683.2 | 17.8 | 89.7 |
+| Inkling Ada | 131,072 | 124,065 | 453.0 | 14.3 | 274.0 |
+
+Windows · Core i7-13700H · 32 GB RAM · 2,560-token prefill chunks and tiled Q4_0 decode. The model returned all three requested records in both runs. [Laptop launch settings](docs/inkling-ada-laptop.md)
+
+</details>
 
 ## Quick start
 
