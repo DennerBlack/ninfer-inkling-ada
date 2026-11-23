@@ -56,6 +56,15 @@ Windows · Core i7-13700H · 32 GB RAM · 2,560-token prefill chunks and tiled Q
 
 </details>
 
+### RTX 5070 Laptop GPU · 8 GB
+
+| Engine | KV capacity, tokens | Input tokens | Prefill, tok/s | Generation, tok/s | TTFT, s |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| Inkling Ada | 65,536 | 61,265 | 903.1 | 20.1 | 67.9 |
+| Inkling Ada | 131,072 | 124,065 | 613.0 | 16.4 | 202.4 |
+
+Windows · Q4_0 KV · 2,560-token prefill chunks. Both runs retrieved all three requested records in order. [RTX 5070 laptop benchmark report](docs/inkling-ada-rtx-5070-laptop.md)
+
 ## Quick start
 
 ### 1. Build the server
