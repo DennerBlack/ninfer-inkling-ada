@@ -1,106 +1,38 @@
-# Contributing to NInfer-all
+# Contributing to Inkling Ada
 
-NInfer-all welcomes precise problem reports, reproducible performance evidence, and carefully scoped
-code contributions. The most useful first contribution is often an Issue that establishes what is
-happening and why it matters. A pull request is an implementation of an agreed change, not the
-place to ask the maintainer to discover the problem, choose its semantics, or redesign its core
-approach.
+This fork focuses on Inkling 2 Mini inference on NVIDIA Ada GPUs. The [README](README.md)
+covers the build and launch settings. The [laptop benchmark](docs/inkling-ada-laptop.md)
+shows how to reproduce the long-context tests.
 
-## Project scope and decisions
+## Bug reports and benchmarks
 
-NInfer-all is an intentionally focused inference engine. Contributions are evaluated against the
-supported product described in [`README.md`](README.md), the public documentation map in
-[`docs/README.md`](docs/README.md), and the applicable architecture documents. Broader
-compatibility or generality is not a benefit by itself when it adds a product contract or
-maintenance surface that the project does not intend to own.
+For a bug, include the commit or release, GPU, driver, CUDA version, model artifact and
+runtime flags. Add the smallest request or command that reproduces it and describe what
+you expected to happen.
 
-The maintainer makes the final decision about product scope, architecture, and long-term
-maintenance. Establishing that a bug is real or that an idea is useful does not imply that a
-particular implementation will be accepted. The maintainer may preserve the report or core idea
-and implement it independently within the current architecture.
+For a performance change, include a baseline and candidate measured on the same machine,
+weights and prompts. Report prefill and generation separately. For long-context runs,
+include the actual input length, KV format and time to first token. Record peak memory or
+the GPU expert cache size when the change affects it. Include a correctness check and
+report regressions alongside speedups.
 
-## Start with an Issue
-
-Every bug, performance opportunity, feature request, protocol change, and architecture proposal
-must begin with an Issue before implementation starts. Use the Issue to establish:
-
-- the concrete problem or use case;
-- whether it occurs within the supported product scope;
-- the expected behavior or performance claim;
-- the affected contract and ownership boundary; and
-- whether an external implementation is appropriate.
-
-Wait for the maintainer to confirm the scope and implementation direction before investing in a
-pull request. Opening an Issue does not by itself approve a proposed design. A pull request without
-a linked, confirmed Issue may be closed without detailed review.
-
-### Bug reports
-
-A bug report must contain enough information for the maintainer to locate and reason about the
-failure. Include, as applicable:
-
-- the exact NInfer commit or release, artifact source, and recipe when using custom weights;
-- the GPU, driver, CUDA toolchain, build configuration, and relevant runtime options;
-- the complete command, request, or smallest practical reproduction;
-- the expected behavior and the observed behavior;
-- relevant logs or error output as text;
-- the reproduction frequency and any known trigger or boundary condition; and
-- checks already performed, including anything that could not be verified.
-
-State clearly when a reproduction is incomplete or when the behavior occurs outside the advertised
-product target. An unsupported use case may still motivate a proposal, but it is not a defect in
-the supported product contract.
-
-### Performance reports
-
-A performance report must identify the level of the claim: operator, schedule, request phase, or
-end-to-end inference. Include the baseline and candidate measurements under comparable conditions,
-the exact workload and commands, hardware and toolchain, warmup and repetition method, and a useful
-summary of the results.
-
-Account for relevant tradeoffs such as workspace, resident memory, transfer cost, numerical quality,
-and effects on other execution paths. End-to-end results can establish an end-to-end observation;
-they do not isolate an operator change. A proposed operator optimization should therefore include a
-direct operator benchmark and appropriate correctness evidence.
-
-### Feature and architecture proposals
-
-Describe the real supported use case, the limitation of the current behavior, the desired semantics,
-and the new contract or maintenance responsibility the project would acquire. Explain why the
-existing architecture cannot satisfy the use case. Do not begin a broad implementation until the
-maintainer has accepted both the product direction and the proposed ownership model.
+If the same problem reproduces on NInfer-all, include that reproduction when reporting it
+upstream. [NInfer-all contribution guide](https://github.com/iamwavecut/ninfer-all/blob/master/CONTRIBUTING.md)
 
 ## Pull request scope
 
-A pull request is appropriate only after its linked Issue has established the problem and the
-maintainer has agreed to its scope and implementation direction. Target pull requests at the
-`master` branch.
+Target [`inkling-ada`](https://github.com/DennerBlack/ninfer-inkling-ada/tree/inkling-ada)
+in this fork. Keep each pull request focused on one fix or improvement. Use the PR
+description to discuss scope for larger changes and link any related discussion. Include
+the tests, measurements or documentation that explain the result.
 
-Each pull request must represent one coherent engineering decision:
-
-- address one confirmed Issue with one consistent design;
-- include all implementation, tests, tooling, and active documentation required to close that
-  decision correctly;
-- keep independent bugs, optimizations, refactors, and product changes in separate pull requests;
-- exclude unrelated cleanup and speculative compatibility work; and
-- avoid changing public semantics or product scope beyond what was agreed in the Issue.
-
-There is no mechanical line-count or file-count limit. A necessary solution may cross several
-files, but every changed part must belong to the same contract and be reviewable and verifiable as
-one unit. A large change that combines independent decisions, crosses ownership boundaries without
-prior agreement, or requires the maintainer to reconstruct its design is not maintainable and will
-not be accepted. Use the Issue, not a draft implementation, to resolve architecture and scope; a
-Draft PR is welcome for early measurement and testing once that direction is agreed.
-
-Work ported from a fork or from upstream keeps its author: port it as the original commits or with
-the author recorded, name the source repository and commit, and say whether the change is a clean
-cherry-pick or adapted to this tree. When the same change is still under review upstream, let it
-settle there before porting it.
+When porting work from elsewhere, preserve the original author and reference the source
+commit. Existing credits are in [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ## Engineering rules
 
-These rules apply to every change, from people and from coding agents. If a change cannot meet a
-rule, its pull request names the rule and gives the reason.
+These rules apply to the paths affected by a change. Include the coverage you verified and any
+relevant gaps in the pull request.
 
 ### Lossless by default
 
@@ -109,21 +41,20 @@ exact: device, host and disk residency and the CPU share of expert products give
 Floating-point changes stay within the oracle criterion of each Op
 ([Op development](docs/maintainer/op-development.md)).
 
-A change that trades accuracy for speed is lossy. Examples: skipped or truncated experts, tokens or
-vocabulary; approximate attention or sampling; lower precision than the current default in storage,
-accumulation or exchanged partials; early exits. A lossy change needs the maintainer's agreement in
-its Issue. It ships as an option that is off by default, and its pull request reports the quality
+A change that trades accuracy for speed is lossy. Examples include skipping experts or tokens,
+approximate attention or sampling, early exit, and reducing storage or accumulation precision.
+A lossy change needs the maintainer's agreement. It ships as an opt-in mode. Report the quality
 cost (perplexity, task accuracy) next to the speed. Formats that the user selects, such as
 `--kv-dtype` and quantized artifacts, are options of this kind.
 
 After a change to expert residency, slot pools, prefetch or the expert cache, `ninfer-perplexity`
 gives the same value on the same text with `--expert-residency host` and with `disk`. Time a prompt
-of 5K tokens or more as well as short ones, and compare greedy token ids and logprobs with `master`
-on long prompts: a perplexity run does not reach every prompt path.
+of 5K tokens or more as well as short ones. On long prompts, compare greedy token IDs and logprobs
+with the target branch because perplexity covers only some prompt paths.
 
 ### Every family
 
-A change to a shared mechanism covers every model family that uses that mechanism: Qwen3.5-core
+A change to shared code must preserve every model family that uses it: Qwen3.5-core
 (dense and MoE releases), Qwen3.8-Flash-Next, Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2. Shared
 mechanisms include KV formats, rotary scaling, prompt chunking, CUDA Graphs, concurrency,
 speculative decoding, sampling, expert residency and the CPU share, pipeline stages, tensor
@@ -140,14 +71,13 @@ parallelism, serving features, and kernels that several families call.
 
 ### Every platform
 
-A change builds and runs on every supported target: `sm_70`, `sm_75`, `sm_80`, `sm_86`, `sm_89` and
-`120a`; CUDA 12.x and 13.x (`sm_70` builds only with 12.x, `120a` only with 13.1 or newer except 13.2.0 and 13.2.1); Linux
-with GCC and Windows with MSVC ([build system](docs/maintainer/build-system.md),
-[Windows build](docs/build-windows.md)).
+Keep shared code compatible with the inherited targets `sm_70`, `sm_75`, `sm_80`, `sm_86`,
+`sm_89` and `120a`, on Linux with GCC and Windows with MSVC. CUDA 12.x is required for
+`sm_70`. The `120a` target requires CUDA 13.1 or newer and excludes 13.2.0 and 13.2.1.
+[Build system](docs/maintainer/build-system.md) · [Windows build](docs/build-windows.md)
 
 - A kernel that needs newer instructions or more shared memory is gated by compute capability, and
-  the other targets keep a working route. A format, option or artifact that runs on one card class
-  only is not a supported feature.
+  the other targets keep a working route. State which GPUs and platforms you tested.
 - Routes and tuning constants come from measured [device profiles](docs/device-profiles.md). A
   constant from upstream, another fork or another card is a hypothesis until it is measured on each
   card that it affects.
@@ -253,13 +183,12 @@ review is not a substitute for contributor debugging or engineering supervision.
 
 ## Pull request description
 
-Use the [PR template](.github/pull_request_template.md) to describe the problem and scope,
-implementation, and verification. One PR completes one agreed change, including its necessary
-implementation, verification and report; submit independent changes separately.
+Use the [PR template](.github/pull_request_template.md) to describe the problem, implementation,
+and verification.
 
 A pull request description must include:
 
-- the linked Issue and the agreed scope;
+- the scope and any related discussion;
 - the concrete design and why it fits the current architecture;
 - the affected behavior, ownership boundary, or public contract;
 - the exact verification commands and summarized results;
@@ -282,7 +211,7 @@ Choose the verification details relevant to your change:
 Review is a limited maintainer resource and is not guaranteed. A pull request may be closed without
 a line-by-line review when it:
 
-- was submitted before its problem, scope, or implementation direction was confirmed;
+- proposes a broad change without establishing its problem or scope;
 - falls outside the supported product or expands an unapproved contract;
 - combines independent changes into an unreviewable implementation;
 - contains evident correctness, ownership, lifetime, state, or boundary problems;

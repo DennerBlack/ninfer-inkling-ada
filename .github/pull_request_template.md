@@ -1,12 +1,12 @@
 <!--
 One PR should complete one agreed change, including its implementation, verification and report.
 Keep independent changes in separate PRs. Follow the applicable verification guidance:
-https://github.com/iamwavecut/ninfer-all/blob/master/CONTRIBUTING.md#pull-request-description
+https://github.com/DennerBlack/ninfer-inkling-ada/blob/inkling-ada/CONTRIBUTING.md#pull-request-description
 -->
 
 ## Problem and scope
 
-Related Issue:
+Related discussion, if applicable
 
 <!-- What concrete problem does this PR solve, and what changes as a result? -->
 
@@ -19,7 +19,7 @@ Related Issue:
 <!--
 Families, build targets, platforms and KV formats this change covers, and each exclusion with its
 reason. Say whether the change is lossless or an opt-in lossy mode, and whether it changes a default:
-https://github.com/iamwavecut/ninfer-all/blob/master/CONTRIBUTING.md#engineering-rules
+https://github.com/DennerBlack/ninfer-inkling-ada/blob/inkling-ada/CONTRIBUTING.md#engineering-rules
 -->
 
 ## Verification

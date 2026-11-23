@@ -8,28 +8,28 @@ One text request at a time. The model is Inkling 2 Mini UD-IQ4_XS, with routed e
 
 Each run asked the model to retrieve three exact record values placed near 10%, 50% and 94% of the input. The context window and KV capacity were set to the same value.
 
-| Window | Chunk | Input tokens | Prefill | Generation | First token | Startup VRAM free | Retrieval |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
-| 65,536 | 1,536 | 61,265 | 539.8 tok/s | 15.9 tok/s | 1m 53.5s | 253 MiB | 3/3 |
-| 65,536 | 2,560 | 61,265 | 683.2 tok/s | 17.8 tok/s | 1m 29.7s | 255 MiB | 3/3 |
-| 131,072 | 1,536 | 124,065 | 379.7 tok/s | 12.0 tok/s | 5m 26.8s | 313 MiB | 3/3 |
-| 131,072 | 2,560 | 124,065 | 453.0 tok/s | 14.3 tok/s | 4m 34.0s | 297 MiB | 3/3 |
+| Window | Chunk | Input tokens | Prefill | Generation | First token | Retrieval |
+| ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| 65,536 | 1,536 | 61,265 | 539.8 tok/s | 15.9 tok/s | 1m 53.5s | 3/3 |
+| 65,536 | 2,560 | 61,265 | 683.2 tok/s | 17.8 tok/s | 1m 29.7s | 3/3 |
+| 131,072 | 1,536 | 124,065 | 379.7 tok/s | 12.0 tok/s | 5m 26.8s | 3/3 |
+| 131,072 | 2,560 | 124,065 | 453.0 tok/s | 14.3 tok/s | 4m 34.0s | 3/3 |
 
-The 2,560-token rows use tiled Q4_0 decode. All four requests returned the same three values in the same order. Total generation length, including reasoning, changed from 210 to 189 tokens at 64K and from 240 to 157 at 128K. Startup VRAM is the estimate from the engine capacity log. Pinned expert sources occupied 13,385 MiB in each run.
+The 2,560-token rows use tiled Q4_0 decode. All four requests returned the same three values in the same order. Total generation length, including reasoning, changed from 210 to 189 tokens at 64K and from 240 to 157 at 128K. The headroom figures below come from the engine capacity log. Pinned expert sources occupied 13,385 MiB in each run.
 
 ## Settings sweep
 
 These are matched requests within each window. The short prompt had 36 input tokens and 114 output tokens. The other prompt had 4,407 input tokens and asked for one exact record value.
 
-| Window | Chunk | Expert cache requested / actual (MiB) | Startup VRAM free | Short generation (tok/s) | 4,407-token prefill (tok/s) | Generation after 4,407 tokens (tok/s) | 4,407-token request time |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 65,536 | 512 | 1,536 / 1,535 | 1,137 MiB | 18.6 | 252.6 | 17.5 | 22.44 s |
-| 131,072 | 512 | 1,536 / 1,535 | 607 MiB | 18.8 | 252.2 | 17.6 | 22.43 s |
-| 65,536 | 512 | 2,304 / 2,301 | 417 MiB | 21.2 | 272.1 | 19.6 | 20.65 s |
-| 65,536 | 1,536 | 1,920 / 1,918 | 377 MiB | 20.8 | 733.7 | 19.3 | 10.48 s |
-| 131,072 | 512 | 1,792 / 1,792 | 351 MiB | 19.5 | 259.2 | 18.2 | 21.81 s |
-| 131,072 | 1,536 | 1,408 / 1,408 | 313 MiB | 19.0 | 703.3 | 18.1 | 11.06 s |
-| 65,536 | 1,536 | 2,048 / 2,044 | 253 MiB | 21.6 | 741.6 | 19.7 | 10.32 s |
+| Window | Chunk | Expert cache requested / actual (MiB) | Short generation (tok/s) | 4,407-token prefill (tok/s) | Generation after 4,407 tokens (tok/s) | 4,407-token request time |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 65,536 | 512 | 1,536 / 1,535 | 18.6 | 252.6 | 17.5 | 22.44 s |
+| 131,072 | 512 | 1,536 / 1,535 | 18.8 | 252.2 | 17.6 | 22.43 s |
+| 65,536 | 512 | 2,304 / 2,301 | 21.2 | 272.1 | 19.6 | 20.65 s |
+| 65,536 | 1,536 | 1,920 / 1,918 | 20.8 | 733.7 | 19.3 | 10.48 s |
+| 131,072 | 512 | 1,792 / 1,792 | 19.5 | 259.2 | 18.2 | 21.81 s |
+| 131,072 | 1,536 | 1,408 / 1,408 | 19.0 | 703.3 | 18.1 | 11.06 s |
+| 65,536 | 1,536 | 2,048 / 2,044 | 21.6 | 741.6 | 19.7 | 10.32 s |
 
 The 1,536-token chunks increased prefill by 2.94× at 64K and 2.79× at 128K on the matched 4,407-token input. The visible text matched across the sweep. The larger chunks changed the generation length for that input from 88 to 87 tokens.
 
@@ -38,25 +38,25 @@ The 128K profile with a 1,536-token chunk and a 1,536 MiB cache reached only 189
 
 ### Larger chunks and tiled decode
 
-| Window | Chunk | Expert cache requested / actual (MiB) | Startup VRAM free | Short generation (tok/s) | 4,407-token prefill (tok/s) | Generation after 4,407 tokens (tok/s) |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 65,536 | 2,048 | 1,856 / 1,853 | 227 MiB | 21.5 | 723.6 | 19.7 |
-| 65,536 | 2,560 | 1,536 / 1,535 | 319 MiB | 20.7 | 976.4 | 19.1 |
-| 65,536 | 3,072 | 1,472 / 1,282 | 351 MiB | 20.2 | 908.1 | 19.0 |
-| 131,072 | 2,048 | 1,216 / 1,169 | 335 MiB | 18.9 | 680.4 | 17.9 |
-| 131,072 | 2,560 | 1,024 / 981 | 297 MiB | 18.8 | 941.4 | 17.7 |
-| 131,072 | 3,072 | 832 / 759 | 297 MiB | 19.0 | 885.4 | 17.8 |
+| Window | Chunk | Expert cache requested / actual (MiB) | Short generation (tok/s) | 4,407-token prefill (tok/s) | Generation after 4,407 tokens (tok/s) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 65,536 | 2,048 | 1,856 / 1,853 | 21.5 | 723.6 | 19.7 |
+| 65,536 | 2,560 | 1,536 / 1,535 | 20.7 | 976.4 | 19.1 |
+| 65,536 | 3,072 | 1,472 / 1,282 | 20.2 | 908.1 | 19.0 |
+| 131,072 | 2,048 | 1,216 / 1,169 | 18.9 | 680.4 | 17.9 |
+| 131,072 | 2,560 | 1,024 / 981 | 18.8 | 941.4 | 17.7 |
+| 131,072 | 3,072 | 832 / 759 | 19.0 | 885.4 | 17.8 |
 
 The 64K admission with a 2,560-token chunk and a 1,664 MiB cache had 193 MiB free at startup. The benchmark exited at its 200 MiB guard. A 1,536 MiB cache left 319 MiB free.
 
 On a matched 15,617-token input in the 128K window, the 2,560-token chunk with tiled decode reduced total request time from 28.73 s to 22.44 s. The generated text, token count and reasoning hash matched.
 
-| Chunk | Decode option | Startup VRAM free | Prefill (tok/s) | Generation (tok/s) | Request time |
-| ---: | :--- | ---: | ---: | ---: | ---: |
-| 1,536 | Default | 313 MiB | 659.4 | 17.3 | 28.73 s |
-| 2,560 | Default | 247 MiB | 892.0 | 17.2 | 22.60 s |
-| 2,560 | Q4_0 tiled decode | 297 MiB | 892.8 | 17.7 | 22.44 s |
-| 2,560 | Cache bias by loop passes | 297 MiB | 901.7 | 16.6 | 22.58 s |
+| Chunk | Decode option | Prefill (tok/s) | Generation (tok/s) | Request time |
+| ---: | :--- | ---: | ---: | ---: |
+| 1,536 | Default | 659.4 | 17.3 | 28.73 s |
+| 2,560 | Default | 892.0 | 17.2 | 22.60 s |
+| 2,560 | Q4_0 tiled decode | 892.8 | 17.7 | 22.44 s |
+| 2,560 | Cache bias by loop passes | 901.7 | 16.6 | 22.58 s |
 
 <details>
 <summary>Initial 8K screen</summary>
