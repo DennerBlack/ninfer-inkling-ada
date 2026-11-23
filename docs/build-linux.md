@@ -85,7 +85,7 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
 ```
 
 The API is available at `http://127.0.0.1:8080/v1`. `docker build --build-arg ARCHS=86 -t ninfer .`
-builds a separate Ubuntu image from source with the `sm_86` build alone; the [README](../README.md#docker)
+builds a separate Ubuntu image from source with the `sm_86` build alone; the [README](../README.upstream.md#docker)
 covers the container's commands, volumes and compose file, and the [launch recipes](recipes.md)
 the command for each published artifact.
 

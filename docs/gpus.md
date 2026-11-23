@@ -11,7 +11,7 @@ cards of different architectures ([several architectures](build-linux.md#cards-o
 configure refuses any other target.
 The Docker pipeline packages two multiarch images: `cuda12.9` contains `70;75;80;86;89`, and
 `cuda13.4` contains `75;80;86;89;120a`. Each uses one executable for all included architectures,
-including a pipeline across different GPU families. See [Docker](../README.md#docker) for tags
+including a pipeline across different GPU families. See [Docker](../README.upstream.md#docker) for tags
 and verification status.
 
 | Architecture | Compute capability | Build | CUDA | Docker tags | Status |

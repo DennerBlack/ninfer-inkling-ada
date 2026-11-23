@@ -3,7 +3,7 @@
 The `ninfer-serve` configurations behind the [reference tables](performance.md), one section per
 model. Each recipe is a [launch configuration file](cli.md#launch-configuration-files) in the
 repository's `configs/` directory; `ninfer-serve --config configs/<file>.ini` runs it from the
-directory that holds `models/`, where the [quick start](../README.md#quick-start) downloads the
+directory that holds `models/`, where the [quick start](../README.upstream.md#quick-start) downloads the
 artifacts. Each file names its model, card and options in its first lines. `ninfer-serve --help` is
 the exact source for option spelling and defaults; [server options](serving.md#server-options) and
 the [CLI options](cli.md) describe every flag, and [Supported GPUs](gpus.md) says what fits a given

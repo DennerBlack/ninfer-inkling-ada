@@ -190,8 +190,8 @@ The compile PDB is fixed to `CMakeFiles/ninfer_ggml_quants.dir/ninfer_ggml_quant
 CMake otherwise changes `/Fd`
 from the static library's named PDB to a directory for object libraries, changing the cache key.
 
-Product commands and prerequisites are in the README's [Quick start](../../README.md#quick-start) and
-[Building](../../README.md#building) sections; test and measurement workflows live in
+Product commands and prerequisites are in the README's [Quick start](../../README.upstream.md#quick-start) and
+[Building](../../README.upstream.md#building) sections; test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
 
 ## Configuration
