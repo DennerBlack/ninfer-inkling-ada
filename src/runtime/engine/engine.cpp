@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "ninfer/engine.h"
 #include "text/structured_output.h"
 
@@ -60,13 +62,13 @@ EngineOptions with_family_context_cache(EngineOptions options) {
     return options;
 }
 
-// The host token embedding is a Qwen3.5 load placement; the other families bind their own tables.
+// These families can bind a device-visible host table for indexed token lookups.
 EngineOptions with_family_embedding(EngineOptions options) {
     if (options.embedding_residency != EmbeddingResidency::Device &&
-        own_family_artifact(options.artifact_path)) {
+        own_family_artifact(options.artifact_path) && !runtime::is_inkling2_artifact(options.artifact_path)) {
         throw std::invalid_argument(
             "--embedding-residency host applies to Qwen3_5ForCausalLM and "
-            "Qwen3_5MoeForCausalLM artifacts");
+            "Qwen3_5MoeForCausalLM or Inkling 2 artifacts");
     }
     return options;
 }
@@ -507,6 +509,10 @@ public:
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        const bool inkling_artifact = runtime::is_inkling2_artifact(options.artifact_path);
+        if (options.kv_cache == KvCacheStorage::InklingQ4_0 && !inkling_artifact) {
+            throw std::invalid_argument("--kv-dtype q4_0 is available for Inkling 2");
+        }
         if (runtime::is_gemma4_artifact(options.artifact_path)) {
             auto constructed    = runtime::construct_gemma4(options, device);
             gemma               = std::move(constructed.instance);
@@ -533,7 +539,7 @@ public:
             finalize_phase.complete();
             return;
         }
-        if (runtime::is_inkling2_artifact(options.artifact_path)) {
+        if (inkling_artifact) {
             auto constructed    = runtime::construct_inkling2(options, device);
             inkling             = std::move(constructed.instance);
             load                = std::move(constructed.load);

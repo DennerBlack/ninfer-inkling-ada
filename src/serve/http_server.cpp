@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "serve/http_server.h"
 #include "serve/slot_files.h"
 
@@ -529,7 +531,35 @@ void HttpServer::register_delete(const std::string& pattern, httplib::Server::Ha
     });
 }
 
+void HttpServer::bind_stream_stop(const httplib::Request& req, std::shared_ptr<std::atomic<bool>> stop) {
+    if (options_.api_key.empty() || req.get_header_value_count("x-hel-request-id") != 1 ||
+        req.get_header_value_count("x-conversation-id") != 1) { return; }
+    const auto rid = req.get_header_value("x-hel-request-id");
+    const auto conv = req.get_header_value("x-conversation-id");
+    if (rid.empty() || rid.size() > 128 || conv.empty() || conv.size() > kMaximumContextCacheSessionKeyBytes) { return; }
+    std::lock_guard lock(stream_stop_mutex_);
+    std::erase_if(stream_stops_, [](const auto& item) { return item.second.expired(); });
+    if (!stream_stops_.emplace(std::make_pair(conv, rid), stop).second) {
+        throw std::invalid_argument("request already streaming");
+    }
+}
+
 void HttpServer::register_routes() {
+    register_delete(api_route_pattern("/stream"), [this](const httplib::Request& req, httplib::Response& res) {
+        if (!options_.api_key.empty() && req.get_param_value_count("conv_id") == 1 &&
+            req.get_header_value_count("x-hel-request-id") == 1) {
+            std::lock_guard lock(stream_stop_mutex_);
+            const auto it = stream_stops_.find({req.get_param_value("conv_id"), req.get_header_value("x-hel-request-id")});
+            if (it != stream_stops_.end()) {
+                if (auto stop = it->second.lock()) {
+                    stop->store(true, std::memory_order_release);
+                    res.status = 204;
+                    return;
+                }
+            }
+        }
+        res.status = 404;
+    });
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
     });

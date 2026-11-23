@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "serve/http_server.h"
 
 #include "serve/http_transport.h"
@@ -367,6 +369,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
     try {
         auto stream                      = std::make_shared<StreamingResponse>();
+        bind_stream_stop(req, std::shared_ptr<std::atomic<bool>>(stream, &stream->cancelled));
         stream->prepared                 = std::move(prepared);
         stream->storage.input_turns      = std::move(request.prompt.input_turns);
         stream->storage.input_items      = std::move(request.prompt.input_items);

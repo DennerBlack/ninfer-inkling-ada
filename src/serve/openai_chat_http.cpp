@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "serve/http_server.h"
 
 #include "serve/http_transport.h"
@@ -52,7 +54,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         prepared = service->prepare(request.generation,
                                     request.stream ? GenerationConsumerMode::Streaming
                                                    : GenerationConsumerMode::Aggregate,
-                                    observation, [&req] { return client_disconnected(req); });
+                                    observation, [&req] { return client_disconnected(req); }, conversation_cache(req));
         prepared.model_hold = std::make_shared<ModelRegistry::Lease>(std::move(lease));
     } catch (const ApiException& exception) {
         record_request_rejected(make_request_rejection_log_context(
@@ -116,6 +118,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         const bool return_progress   = request.return_progress;
         const bool timings_per_token = request.timings_per_token;
         auto stream                  = std::make_shared<HttpGenerationStream>(std::move(prepared));
+        bind_stream_stop(req, std::shared_ptr<std::atomic<bool>>(stream, &stream->cancelled));
         auto encoder = std::make_shared<OpenAIChatStream>(identity, request.include_usage,
                                                           timings_per_token, return_progress,
                                                           options_.usage_chunk_choice,

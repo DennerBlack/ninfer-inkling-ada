@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 // Inkling 2's DSpark drafter kernels against FP64 oracles at the release drafter's shapes (hidden
 // 2304, 24 query heads over 8 of width 128, a 1024-position window, a block of 8, a recurrent head
 // of rank 256):
@@ -7,7 +9,7 @@
 //  - spark_mix: the softmax-weighted mixes of four taps RMS-normed per mix, BF16 and q8_1 rows,
 //    the last mix FP32 into the context ring from its first row on, rows past `end` untouched.
 //  - spark_rotate: per-head RMS norm and NeoX rotation of queries in place and of keys into F16
-//    caches with the values beside them (window ring and full cache), at positions up to 2^20 - 1
+//    and Q4_0 caches with the values beside them, at positions up to 2^20 - 1
 //    (the angle formed in FP64).
 //  - spark_step: the recurrent head's joint projection, the soft-capped logits over the head's
 //    table, the first maximum (an exact tie included), its probability and the state update, three
@@ -16,6 +18,7 @@
 
 #include "core/device_buffer.h"
 #include "models/inkling2/kernels.h"
+#include "q4_oracle.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -30,6 +33,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -108,7 +112,7 @@ double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 // ---- Attention over a uniform block -------------------------------------------------------------
 
 void uniform_case(const std::string& name, int anchor, int rows, int ring, int window, int splits,
-                  std::mt19937& rng) {
+                  std::mt19937& rng, bool packed = false) {
     const int sequences = 2, sequence = 1;
     const int last = anchor + rows - 1;
     const int slots = ring != 0 ? ring : last + 1;
@@ -123,7 +127,10 @@ void uniform_case(const std::string& name, int anchor, int rows, int ring, int w
     std::vector<std::int32_t> positions(rows), seqs(rows, sequence);
     for (int i = 0; i < rows; ++i) { positions[i] = anchor + i; }
     const float scale = 1.0f / std::sqrt(float(kD));
-    DeviceBuffer dk = upload(kc), dv = upload(vc), dq = upload(q), dp = upload(positions),
+    const auto cache_plane = [packed](std::vector<__half>& values) {
+        return packed ? upload(q4_oracle::encode_plane(values)) : upload(values);
+    };
+    DeviceBuffer dk = cache_plane(kc), dv = cache_plane(vc), dq = upload(q), dp = upload(positions),
                  dsq = upload(seqs), partial(k::attention_workspace_floats(rows, kHeads, splits) * 4),
                  out(std::size_t(rows) * kHeads * kD * 2),
                  q8(std::size_t(rows) * kHeads * kD + std::size_t(rows) * (kHeads * kD / 32) * 4);
@@ -134,8 +141,10 @@ void uniform_case(const std::string& name, int anchor, int rows, int ring, int w
     a.q              = as<float>(dq);
     a.k_cache        = as<__half>(dk);
     a.v_cache        = as<__half>(dv);
-    a.seq_stride     = seq_stride;
-    a.head_stride    = head_stride;
+    a.head_stride    = packed ? std::int64_t(slots) * kD / 32 * sizeof(q4_oracle::Block) / 2
+                              : head_stride;
+    a.seq_stride     = a.head_stride * kKv;
+    a.packed_q4      = packed;
     a.ring           = ring;
     a.window         = window;
     a.query_heads    = kHeads;
@@ -373,13 +382,16 @@ void rotate_case(std::mt19937& rng) {
     }
     report(eq.rel() < 2e-5 && rest, "spark_rotate queries: " + num(eq.rel()) +
                                         (rest ? "" : ", other columns changed"));
-    // Keys and values into a window ring and a full cache, rows [2, 7).
-    for (const int ring : {kWindow + 32, 0}) {
+    // Rows [2, 7) use both sequence lanes and cross the sliding-window boundary.
+    for (const auto [ring, packed] : {std::pair{kWindow + 32, false},
+                                     std::pair{0, false}, std::pair{0, true}}) {
         const int kv_stride = 2 * kKv * kD;
         const auto kvx = normal(std::size_t(t) * kv_stride, 1.0f, rng);
         DeviceBuffer dkv = upload(kvx);
         const int slots = ring != 0 ? ring : 50001;
-        const std::int64_t head_stride = std::int64_t(slots) * kD, seq_stride = head_stride * kKv;
+        const int row_units = packed ? kD / 32 * sizeof(q4_oracle::Block) / 2 : kD;
+        const std::int64_t head_stride = std::int64_t(slots) * row_units;
+        const std::int64_t seq_stride = head_stride * kKv;
         DeviceBuffer kc(std::size_t(2) * seq_stride * 2), vc(std::size_t(2) * seq_stride * 2);
         kc.fill(0);
         vc.fill(0);
@@ -395,6 +407,7 @@ void rotate_case(std::mt19937& rng) {
         b.seq_stride  = seq_stride;
         b.head_stride = head_stride;
         b.ring        = ring;
+        b.packed_q4   = packed;
         k::spark_rotate(b, nullptr);
         sync("spark_rotate kv");
         Error ek, ev;
@@ -403,18 +416,37 @@ void rotate_case(std::mt19937& rng) {
             for (int h = 0; h < kKv; ++h) {
                 double want[kD];
                 rotate_reference(kvx.data() + std::size_t(r) * kv_stride + h * kD, norm, positions[r], want);
-                const std::int64_t at = seqs[r] * seq_stride + h * head_stride + std::int64_t(slot) * kD;
+                const auto* values = kvx.data() + std::size_t(r) * kv_stride + (kKv + h) * kD;
+                const std::int64_t at = seqs[r] * seq_stride + h * head_stride + std::int64_t(slot) * row_units;
+                if (packed) {
+                    std::vector<q4_oracle::Block> got_k(kD / 32), got_v(kD / 32);
+                    check(cudaMemcpy(got_k.data(), as<__half>(kc) + at, row_units * 2, cudaMemcpyDeviceToHost), "k q4");
+                    check(cudaMemcpy(got_v.data(), as<__half>(vc) + at, row_units * 2, cudaMemcpyDeviceToHost), "v q4");
+                    for (int block = 0; block < kD / 32; ++block) {
+                        const int offset = block * 32;
+                        const auto ref_k = q4_oracle::encode([&](int d) { return float(want[offset + d]); });
+                        const auto ref_v = q4_oracle::encode([&](int d) { return values[offset + d]; });
+                        for (int d = 0; d < 32; ++d) {
+                            ek.add(__half2float(q4_oracle::decode(got_k[block], d)),
+                                   __half2float(q4_oracle::decode(ref_k, d)));
+                            ev.add(__half2float(q4_oracle::decode(got_v[block], d)),
+                                   __half2float(q4_oracle::decode(ref_v, d)));
+                        }
+                    }
+                    continue;
+                }
                 std::vector<__half> gk(kD), gv(kD);
                 check(cudaMemcpy(gk.data(), as<__half>(kc) + at, kD * 2, cudaMemcpyDeviceToHost), "k");
                 check(cudaMemcpy(gv.data(), as<__half>(vc) + at, kD * 2, cudaMemcpyDeviceToHost), "v");
                 for (int d = 0; d < kD; ++d) {
                     ek.add(__half2float(gk[d]), want[d]);
-                    ev.add(__half2float(gv[d]), kvx[std::size_t(r) * kv_stride + (kKv + h) * kD + d]);
+                    ev.add(__half2float(gv[d]), values[d]);
                 }
             }
         }
+        const char* layout = ring != 0 ? "F16 ring" : (packed ? "Q4_0 full cache" : "F16 full cache");
         report(ek.rel() < 1e-3 && ev.rel() < 1e-3,
-               std::string("spark_rotate keys and values, ") + (ring != 0 ? "window ring" : "full cache") +
+               std::string("spark_rotate keys and values, ") + layout +
                    ": K " + num(ek.rel()) + ", V " + num(ev.rel()));
     }
 }
@@ -623,6 +655,7 @@ int main() {
         uniform_case("full cache", 2100, kBlock, 0, 0, 1, rng);
         uniform_case("full cache", 2100, kBlock, 0, 0, 20, rng);
         uniform_case("full cache", 40, 3, 0, 0, 20, rng);
+        uniform_case("Q4_0 full cache", 2100, kBlock, 0, 0, 20, rng, true);
         mix_case("decode rows, q8_1", 5, true, 5, 0, false, rng);
         mix_case("prompt rows, bf16", 40, false, 37, 9, true, rng);
         rotate_case(rng);

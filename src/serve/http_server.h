@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #pragma once
 
 #include "serve/console_stats.h"
@@ -140,6 +142,9 @@ private:
 
     [[nodiscard]] httplib::Server::HandlerResponse pre_route(const httplib::Request& req,
                                                              httplib::Response& res) const;
+    std::mutex stream_stop_mutex_;
+    std::map<std::pair<std::string, std::string>, std::weak_ptr<std::atomic<bool>>> stream_stops_;
+    void bind_stream_stop(const httplib::Request& req, std::shared_ptr<std::atomic<bool>> stop);
     void register_routes();
     // Body-carrying routes are registered through httplib's content-reader form so that
     // --max-request-mib stays the only source of a 413; see buffer_request_body.

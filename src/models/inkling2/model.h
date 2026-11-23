@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #pragma once
 
 // Inkling 2 (Inkling2LoopForConditionalGeneration): the immutable model a v3 artifact describes.
@@ -90,6 +92,7 @@ struct TextWeights {
 };
 
 struct ExpertBanks {
+    std::uint32_t layer_index = 0;
     QType gate_up_type{}, down_type{};
     std::uint64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     ExpertDeliveryLayer delivery;
@@ -142,6 +145,8 @@ struct LoadOptions {
     std::vector<double> expert_split;
     // Binds the artifact's `vision` component, which must then exist, in this placement.
     VisionPlacement vision = VisionPlacement::None;
+    bool map_pinned = false;
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
     bool dspark            = false; // bind the artifact's DSpark drafter
     // Loads the standalone DSpine drafter artifact at this path (--spec dspine --draft-model) on
     // rank 0; empty for none. It excludes the DSpark drafter.

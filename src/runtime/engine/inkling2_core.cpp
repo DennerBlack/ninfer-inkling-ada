@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "runtime/engine/inkling2_core.h"
 
 #include "artifact/formats.h"
@@ -46,6 +48,7 @@
 #include <stdexcept>
 #include <thread>
 #include <variant>
+#include <unordered_map>
 
 namespace ninfer::runtime {
 namespace {
@@ -142,15 +145,21 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                     "--adaptive-mtp only with --spec dspark and --draft-min-p only "
                                     "with --spec dspine or dspark");
     }
+    const bool packed_q4 = options.kv_cache == KvCacheStorage::InklingQ4_0;
     if (options.kv_cache != KvCacheStorage::BFloat16 &&
-        options.kv_cache != KvCacheStorage::Float16) {
+        options.kv_cache != KvCacheStorage::Float16 && !packed_q4) {
         throw std::invalid_argument(
-            "Inkling 2 keeps its KV cache in F16 (--kv-dtype fp16, or bf16, the default)");
+            "Inkling 2 accepts --kv-dtype fp16, bf16 (default F16), or q4_0");
     }
     const auto& hybrid = options.hybrid_experts;
-    if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
+    if (hybrid.mapped_misses && (options.expert_residency != ExpertResidency::Host ||
+        !options.expert_cache_bytes || options.tensor_parallel || hybrid.dma_share.value_or(1) != 1 ||
+        hybrid.cpu_threads != 0 || !hybrid.record_profile.empty())) {
+        throw std::invalid_argument("Inkling 2 mapped misses require fixed-cache GPU execution with host experts");
+    }
+    if (hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
         hybrid.adaptive_cache) {
-        throw std::invalid_argument("Inkling 2 has no mapped misses, tail skip, prefill buffers or "
+        throw std::invalid_argument("Inkling 2 has no tail skip, prefill buffers or "
                                     "adaptive expert cache (Qwen3.8-Flash-Next options)");
     }
     if (options.expert_residency == ExpertResidency::Device &&
@@ -180,6 +189,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                     .experts  = options.expert_residency,
                                     .vision   = vision,
                                     .dspark   = dspark};
+    load.map_pinned = hybrid.mapped_misses;
+    load.embedding_residency = options.embedding_residency;
     if (dspine) { load.dspine = speculative.draft_model; }
     // Expert parallelism: the routed experts divided over the devices, everything else on the
     // first. Without --tensor-split each device takes a share of its speed that fits beside what
@@ -230,6 +241,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.max_context   = options.max_context;
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs   = options.use_cuda_graph;
+    executor.packed_q4    = packed_q4;
     executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
     executor.dspine        = dspine;
     executor.dspark        = dspark;
@@ -248,7 +260,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         executor.draft_tokens = std::max(drafts, lookup_drafts);
     }
     executor.expert_cache_bytes = options.expert_cache_bytes;
-    executor.expert_dma_share   = hybrid.dma_share;
+    executor.mapped_misses = hybrid.mapped_misses;
+    executor.expert_dma_share = hybrid.mapped_misses ? std::optional<float>(1.0F) : hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
     executor.expert_disk        = {hybrid.mirror, hybrid.direct};
     // An image of `budget` cells has 2 x 2 patches each.
@@ -267,7 +280,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                            options.max_context, model->config().max_position_embeddings);
     }
     if (options.expert_residency != ExpertResidency::Device) {
-        const std::vector<std::size_t> widths(model->expert_banks().size(),
+        const std::vector<std::size_t> widths(model->config().num_hidden_layers,
                                               std::size_t(model->config().num_experts));
         if (!hybrid.routing_profile.empty()) {
             executor.expert_profile = models::read_expert_profile(hybrid.routing_profile,
@@ -275,22 +288,35 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         } else {
             executor.expert_profile = models::builtin_expert_profile("inkling2", widths);
         }
+        if (executor.expert_profile && model->expert_banks().size() < widths.size()) {
+            models::ExpertRouteCounts streamed;
+            for (const auto& bank : model->expert_banks()) {
+                streamed.push_back(std::move(executor.expert_profile->at(bank.layer_index)));
+            }
+            executor.expert_profile = std::move(streamed);
+        }
     }
     // Causal scoring keeps no context between requests.
     executor.checkpoints   = options.context_cache.enabled &&
                            options.purpose == EnginePurpose::Generation;
-    // Prompt chunks of 2048 tokens whatever was requested: the routed
+    // Prompt chunks of 2048 tokens unless another size is requested: the routed
     // experts' matrix kernel fills its widest tile only at wide chunks, and larger chunks grow the
-    // sliding-window rings (window + chunk). A device without room for that chunk's workspace takes
-    // the widest of 1024 and 512 that fits.
-    for (const std::uint32_t chunk : {2048u, 1024u, 512u}) {
-        executor.prefill_chunk = chunk;
+    // sliding-window rings. Fall back only to smaller chunks when the workspace does not fit.
+    constexpr std::uint32_t kMaxChunk = 4096;
+    const std::uint32_t requested =
+        options.prefill_chunk ? std::clamp(options.prefill_chunk, 512u, kMaxChunk) : 2048u;
+    std::vector<std::uint32_t> chunks{requested};
+    for (const std::uint32_t smaller : {2048u, 1024u, 512u}) {
+        if (smaller < requested) { chunks.push_back(smaller); }
+    }
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        executor.prefill_chunk = chunks[i];
         try {
             instance->executor =
                 std::make_unique<models::inkling2::Executor>(*model, device, executor);
             break;
         } catch (const models::inkling2::InsufficientMemory&) {
-            if (chunk == 512) { throw; }
+            if (i + 1 == chunks.size()) { throw; }
         }
     }
     device.synchronize();
@@ -303,9 +329,13 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     instance->free_after_weights = free_after_weights;
     instance->free_after_startup = free_bytes();
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "Inkling 2: %u sequence(s), prompt chunks of %u tokens, F16 KV %.0f MiB%s, "
+                       "Inkling 2: CUDA Graph target %s, DSpark %s",
+                       instance->executor->target_graphs_enabled() ? "on" : "off",
+                       dspark && options.use_cuda_graph ? "on" : "off");
+    publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                       "Inkling 2: %u sequence(s), prompt chunks of %u tokens, %s KV %.0f MiB%s, "
                        "workspace %.0f MiB",
-                       executor.sequences, executor.prefill_chunk,
+                       executor.sequences, executor.prefill_chunk, packed_q4 ? "Q4_0" : "F16",
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
                        instance->executor->memory().kv_grows
                            ? " at most, growing with the sequences beside an elastic expert cache"
@@ -478,6 +508,8 @@ struct Inkling2Core::Request {
     std::vector<TokenLogprob> content_logprobs;
 
     std::uint32_t anchor_at = 0;
+    std::string cache_owner;
+    std::vector<std::uint32_t> private_at;
     bool reusable           = true;
     // The prompt's images in prompt order, and each image's span rows (BF16 [span][hidden], by
     // vision item), encoded once when a prompt chunk first reaches the image.
@@ -544,6 +576,9 @@ struct Inkling2Core::Impl {
         std::vector<MediaMark> media, anchor_media;
         // runtime::lookup_draft's copy source, as its distance from the end of `fed`.
         std::size_t lookup_lag = 0;
+        std::uint64_t parent_image = 0;
+        std::uint32_t parent_frontier = 0;
+        std::string cache_owner;
         models::inkling2::SequenceSnapshot snapshot;
         std::uint64_t last_used = 0;
         bool disposable         = false; // its last request's
@@ -563,7 +598,7 @@ struct Inkling2Core::Impl {
     Inkling2Instance& instance;
     DeviceContext& device;
     const std::uint32_t max_context;
-    const KvCacheStorage kv_cache; // the requested name of the F16 cache (bf16 or fp16)
+    const KvCacheStorage kv_cache;
     const std::size_t max_outstanding;
     const std::chrono::milliseconds pending_timeout;
     const std::uint32_t domain;
@@ -608,15 +643,21 @@ struct Inkling2Core::Impl {
         std::vector<MediaMark> media;
         models::inkling2::SequenceImage header;
         PrefixReusePath path = PrefixReusePath::PrivateEndpoint;
-        std::vector<std::byte*> pages; // slices of host_pages
+        std::string owner;
+        std::vector<std::byte*> pages; // stable slices of pinned chunks
         std::uint64_t bytes     = 0;
+        std::uint64_t id        = 0;
+        bool interior_anchor = false;
         std::uint64_t last_used = 0;
     };
-    // The images live in pages of one buffer pinned at startup: pinning and unpinning each image
-    // would stall every sequence, and since nothing is freed, the copies need no host wait (the
-    // executor's stream orders a page's reuse after the copies before it).
+    // Chunks grow on demand and remain stable until shutdown. The execution stream orders reuse
+    // of an evicted page after its previous copies.
     static constexpr std::size_t kHostPageBytes = std::size_t(8) << 20;
-    std::unique_ptr<HostPages> host_pages;
+    std::vector<std::unique_ptr<HostPages>> host_chunks;
+    std::size_t pinned_pages = 0;
+    std::uint32_t long_anchor_limit = 0;
+    std::uint64_t host_reserve = 0, next_image_id = 0;
+    std::unordered_map<std::byte*, std::size_t> page_refs;
     std::vector<std::byte*> free_pages;
     // An image holds the sliding rings whatever its length (53 MiB in F16), which copy back in a
     // few milliseconds against about 0.2 ms of prefill per token: the bound is the budget. A
@@ -678,20 +719,17 @@ struct Inkling2Core::Impl {
         }
         if (reuse_prefixes) {
             // The host tier's budget, sized here once the weights are loaded when it is
-            // automatic, and pinned now in whole pages.
+            // automatic. Unused capacity does not consume committed or pinned host RAM.
             const ContextCacheOptions& cache = options.context_cache;
             const ContextCacheOptions sized  = resolve_auto_host_cache_now(cache, 0U);
             const std::uint64_t budget =
                 sized.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
             const std::size_t pages = static_cast<std::size_t>(budget / kHostPageBytes);
             host_budget             = std::uint64_t(pages) * kHostPageBytes;
-            if (pages > 0) {
-                host_pages = std::make_unique<HostPages>(host_budget);
-                host_pages->pin();
-                auto* base = static_cast<std::byte*>(host_pages->data());
-                free_pages.reserve(pages);
-                for (std::size_t i = pages; i-- > 0;) { free_pages.push_back(base + i * kHostPageBytes); }
-            }
+            free_pages.reserve(pages);
+            page_refs.reserve(pages);
+            host_reserve = cache.host_cache_auto ? cache.host_cache_reserve_bytes : 0;
+            long_anchor_limit = cache.max_long_anchors_per_continuation.value_or(2);
         }
         const std::size_t rows = slots.size();
         // A sampling call's columns per row: one, or a verification's drafts and bonus.
@@ -997,6 +1035,18 @@ struct Inkling2Core::Impl {
         stats.decode_ready_requests = decoding;
     }
 
+    void release_pages(const std::vector<std::byte*>& pages) {
+        for (auto* page : pages) {
+            auto ref = page_refs.find(page);
+            if (ref == page_refs.end()) { throw std::logic_error("inkling2: unknown checkpoint page"); }
+            if (--ref->second == 0) {
+                page_refs.erase(ref);
+                free_pages.push_back(page);
+                host_used -= kHostPageBytes;
+            }
+        }
+    }
+
     // Drops every stored image of a prefix of the request's prompt.
     void drop_stored_prefixes(const Request& r) {
         for (std::size_t i = stored.size(); i-- > 0;) {
@@ -1005,8 +1055,7 @@ struct Inkling2Core::Impl {
                 !std::equal(tokens.begin(), tokens.end(), r.prompt_tokens.begin())) {
                 continue;
             }
-            free_pages.insert(free_pages.end(), stored[i].pages.begin(), stored[i].pages.end());
-            host_used -= stored[i].pages.size() * kHostPageBytes;
+            release_pages(stored[i].pages);
             stored.erase(stored.begin() + static_cast<std::ptrdiff_t>(i));
         }
         std::lock_guard lock(stats_mutex);
@@ -1071,23 +1120,43 @@ struct Inkling2Core::Impl {
     // the budget cannot hold it at all.
     bool make_host_room(std::uint64_t bytes) {
         const std::size_t pages = static_cast<std::size_t>((bytes + kHostPageBytes - 1) / kHostPageBytes);
-        if (pages > host_budget / kHostPageBytes) { return false; }
+        const std::size_t budget_pages = host_budget / kHostPageBytes;
+        if (pages > budget_pages) { return false; }
+        while (free_pages.size() < pages && pinned_pages < budget_pages) {
+            auto count = std::min({pages - free_pages.size(), budget_pages - pinned_pages, std::size_t(16)});
+            if (auto available = available_host_memory_bytes()) {
+                const auto spare = *available - std::min(*available, host_reserve);
+                count = std::min(count, static_cast<std::size_t>(spare / kHostPageBytes));
+                if (count == 0) { break; }
+            }
+            try {
+                auto chunk = std::make_unique<HostPages>(count * kHostPageBytes);
+                chunk->pin();
+                auto* base = static_cast<std::byte*>(chunk->data());
+                host_chunks.push_back(std::move(chunk));
+                for (std::size_t i = count; i-- > 0;) { free_pages.push_back(base + i * kHostPageBytes); }
+                pinned_pages += count;
+            } catch (const std::exception&) {
+                // Optional cache under memory pressure still uses pages already registered.
+                break;
+            }
+        }
         while (free_pages.size() < pages) {
             const auto oldest = std::min_element(stored.begin(), stored.end(), [](const Stored& a, const Stored& b) {
                 return a.last_used < b.last_used;
             });
             if (oldest == stored.end()) { return false; }
-            free_pages.insert(free_pages.end(), oldest->pages.begin(), oldest->pages.end());
-            host_used -= oldest->pages.size() * kHostPageBytes;
+            release_pages(oldest->pages);
             stored.erase(oldest);
         }
         return true;
     }
 
     [[nodiscard]] std::optional<std::size_t> stored_index(const std::vector<TokenId>& tokens,
-                                                          const std::vector<MediaMark>& media) const {
+                                                          const std::vector<MediaMark>& media,
+                                                          std::string_view owner = {}) const {
         for (std::size_t i = 0; i < stored.size(); ++i) {
-            if (stored[i].tokens == tokens && stored[i].media == media) { return i; }
+            if (stored[i].owner == owner && stored[i].tokens == tokens && stored[i].media == media) { return i; }
         }
         return std::nullopt;
     }
@@ -1096,6 +1165,7 @@ struct Inkling2Core::Impl {
     [[nodiscard]] std::pair<std::size_t, std::uint32_t> find_stored(const Request& prompt) const {
         std::pair<std::size_t, std::uint32_t> best{0, 0};
         for (std::size_t i = 0; i < stored.size(); ++i) {
+            if (!stored[i].owner.empty() && stored[i].owner != prompt.cache_owner) { continue; }
             const std::uint32_t length = prefix_reuse(stored[i].tokens, stored[i].media, prompt);
             if (length > best.second) { best = {i, length}; }
         }
@@ -1116,14 +1186,15 @@ struct Inkling2Core::Impl {
     // the store, unless the store already holds that prefix or it is too short to be worth it.
     void store_image(std::uint32_t s, const std::vector<TokenId>& tokens,
                      const std::vector<MediaMark>& media,
-                     const models::inkling2::SequenceSnapshot* at, PrefixReusePath path) {
+                     const models::inkling2::SequenceSnapshot* at, PrefixReusePath path,
+                     std::string_view owner = {}, bool interior_anchor = false) {
         if (host_budget == 0) { return; }
         if (path == PrefixReusePath::SharedStablePrefix
                 ? !image_pays(static_cast<std::uint32_t>(tokens.size()))
                 : tokens.size() < kMinStoredTokens) {
             return;
         }
-        if (const auto known = stored_index(tokens, media)) {
+        if (const auto known = stored_index(tokens, media, owner)) {
             stored[*known].last_used = ++use_clock;
             return;
         }
@@ -1131,22 +1202,78 @@ struct Inkling2Core::Impl {
         const auto position = at != nullptr ? at->position : executor.position(s);
         if (position != tokens.size()) { return; } // the state holds other tokens
         const std::uint64_t bytes = executor.image_bytes(position);
-        if (!make_host_room(bytes)) { return; }
+        const auto page_count = static_cast<std::size_t>((bytes + kHostPageBytes - 1) / kHostPageBytes);
+        if (page_count > host_budget / kHostPageBytes) { return; }
+        Slot& slot = slots.at(s);
         Stored image;
+        // Borrow only from the exact execution state this slot produced or restored. A token
+        // match alone does not establish identical intermediate values across execution shapes.
+        const auto parent = std::find_if(stored.begin(), stored.end(), [&](const Stored& x) {
+            return x.id == slot.parent_image;
+        });
+        if (parent != stored.end()) {
+            const auto frontier = std::min(position, slot.parent_frontier);
+            // Общая и личная точки могут ссылаться на одно исполнение на одной границе.
+            // Тогда сохраняем и кольца один раз, сохраняя отдельные права доступа.
+            const bool same_state = parent->header.position == position && frontier == position &&
+                                    parent->tokens == tokens && parent->media == media;
+            const auto n = same_state ? page_count : executor.shareable_image_bytes(frontier) / kHostPageBytes;
+            image.pages.assign(parent->pages.begin(), parent->pages.begin() + n);
+            for (auto* page : image.pages) { ++page_refs.at(page); }
+        }
+        if (!owner.empty()) {
+            // A newer tail must not evict the only earlier branch point of the conversation.
+            const auto limit = path == PrefixReusePath::PrivateLongAnchor ? 1U : 2U;
+            std::size_t matches = 0;
+            auto oldest = stored.end();
+            for (auto it = stored.begin(); it != stored.end(); ++it) {
+                if (it->owner != owner || it->path != path || it->interior_anchor != interior_anchor) { continue; }
+                ++matches;
+                if (oldest == stored.end() || it->last_used < oldest->last_used) { oldest = it; }
+            }
+            if (matches >= limit && oldest != stored.end()) {
+                release_pages(oldest->pages);
+                stored.erase(oldest);
+            }
+        }
+        const auto inherited = image.pages.size();
+        const auto needed = page_count - inherited;
+        if (!make_host_room(needed * kHostPageBytes)) {
+            release_pages(image.pages);
+            return;
+        }
         image.tokens = tokens;
         image.media  = media;
         image.path   = path;
+        image.owner  = owner;
+        image.interior_anchor = interior_anchor;
         image.bytes  = bytes;
-        const auto count = static_cast<std::ptrdiff_t>((bytes + kHostPageBytes - 1) / kHostPageBytes);
-        image.pages.assign(free_pages.end() - count, free_pages.end());
-        free_pages.erase(free_pages.end() - count, free_pages.end());
-        image.header    = executor.save_image(s, at, image.pages, kHostPageBytes);
+        auto first_free = free_pages.end() - static_cast<std::ptrdiff_t>(needed);
+        for (auto it = first_free; it != free_pages.end(); ++it) { page_refs.emplace(*it, 1); }
+        image.pages.insert(image.pages.end(), first_free, free_pages.end());
+        free_pages.erase(first_free, free_pages.end());
+        host_used += needed * kHostPageBytes;
+        image.header = executor.save_image(s, at, image.pages, kHostPageBytes, inherited);
+        image.id = ++next_image_id;
+        slot.parent_image = image.id;
+        slot.parent_frontier = position;
+        if (std::getenv("HEL_INKLING_TRACE_PREFIX")) {
+            std::fprintf(stderr,
+                         "Inkling 2 host cache: position=%u path=%u image=%.1f MiB shared=%zu MiB "
+                         "added=%zu MiB pinned=%zu MiB occupied=%llu MiB\n",
+                         position, static_cast<unsigned>(path), double(bytes) / 1048576.0,
+                         inherited * kHostPageBytes >> 20, needed * kHostPageBytes >> 20,
+                         pinned_pages * kHostPageBytes >> 20,
+                         static_cast<unsigned long long>(host_used >> 20));
+        }
         image.last_used = ++use_clock;
-        host_used += image.pages.size() * kHostPageBytes;
         stored.push_back(std::move(image));
         std::lock_guard lock(stats_mutex);
-        stats.state_d2h_count += 1;
-        stats.state_d2h_bytes += bytes;
+        const auto transferred = bytes - std::min<std::uint64_t>(bytes, inherited * kHostPageBytes);
+        if (transferred != 0) {
+            stats.state_d2h_count += 1;
+            stats.state_d2h_bytes += transferred;
+        }
         stats.host_kv_occupied_bytes = host_used;
     }
 
@@ -1158,10 +1285,10 @@ struct Inkling2Core::Impl {
                               std::equal(slot.anchor.begin(), slot.anchor.end(), slot.fed.begin());
         if (anchored) {
             store_image(s, slot.anchor, slot.anchor_media, &slot.snapshot,
-                        PrefixReusePath::PrivateTurnClosure);
+                        PrefixReusePath::PrivateTurnClosure, slot.cache_owner);
         }
         if (slot.fed != slot.anchor && !slot.disposable) {
-            store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
+            store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint, slot.cache_owner);
         }
     }
 
@@ -1169,6 +1296,8 @@ struct Inkling2Core::Impl {
     void restore_stored(std::uint32_t s, std::size_t index) {
         Stored& image = stored.at(index);
         instance.executor->load_image(s, image.header, image.pages, kHostPageBytes);
+        slots[s].parent_image = image.id;
+        slots[s].parent_frontier = image.header.position;
         image.last_used = ++use_clock;
         std::lock_guard lock(stats_mutex);
         stats.state_h2d_count += 1;
@@ -1235,6 +1364,14 @@ struct Inkling2Core::Impl {
         // longest prefix the store keeps; what the sequence held goes to the store first.
         std::uint32_t reused = 0;
         if (reuse_prefixes && r.reusable) {
+            if (std::getenv("HEL_INKLING_TRACE_PREFIX")) {
+                const auto common = [&](const auto& prior) {
+                    const auto n = std::min(prior.size(), r.prompt_tokens.size());
+                    return std::size_t(std::mismatch(prior.begin(), prior.begin()+n, r.prompt_tokens.begin()).first-prior.begin());
+                };
+                std::fprintf(stderr, "Inkling 2 prefix: input=%zu frontier=%u live=%zu common=%zu anchor=%zu common=%zu\n",
+                    r.prompt_tokens.size(), r.anchor_at, slot.fed.size(), common(slot.fed), slot.anchor.size(), common(slot.anchor));
+            }
             const std::uint32_t live       = prefix_reuse(slot.fed, slot.media, r);
             const std::uint32_t anchored   = prefix_reuse(slot.anchor, slot.anchor_media, r);
             const auto [image, from_store] = find_stored(r);
@@ -1242,9 +1379,11 @@ struct Inkling2Core::Impl {
                 std::vector<TokenId> tokens  = stored[image].tokens;
                 std::vector<MediaMark> media = stored[image].media;
                 const PrefixReusePath path   = stored[image].path;
+                const std::string owner = stored[image].owner;
+                stored[image].last_used = ++use_clock;
                 retire(s);
                 // Retiring may have dropped or moved the image: find it again.
-                if (const auto index = stored_index(tokens, media)) {
+                if (const auto index = stored_index(tokens, media, owner)) {
                     restore_stored(s, *index);
                     slot.fed   = std::move(tokens);
                     slot.media = std::move(media);
@@ -1256,6 +1395,7 @@ struct Inkling2Core::Impl {
             } else if (anchored > live) {
                 retire(s);
                 executor.restore(s, slot.snapshot);
+                slot.parent_frontier = std::min(slot.parent_frontier, slot.snapshot.position);
                 slot.fed     = slot.anchor;
                 slot.media   = slot.anchor_media;
                 reused       = anchored;
@@ -1268,6 +1408,8 @@ struct Inkling2Core::Impl {
         if (reused == 0) {
             if (reuse_prefixes) { retire(s); }
             executor.reset(s);
+            slot.parent_image = 0;
+            slot.parent_frontier = 0;
             slot.fed.clear();
             slot.anchor.clear();
             slot.media.clear();
@@ -1276,6 +1418,7 @@ struct Inkling2Core::Impl {
         slot.request    = request;
         slot.last_used  = ++use_clock;
         slot.disposable = r.disposable;
+        slot.cache_owner = r.cache_owner;
         r.reused = r.prefilled = reused;
         if (drafts > 0) {
             r.speculative.enabled      = true;
@@ -1356,6 +1499,9 @@ struct Inkling2Core::Impl {
                 std::min<std::size_t>(left, instance.executor->options().prefill_chunk));
         }
         std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
+        for (const auto frontier : r.private_at) {
+            if (frontier > r.prefilled) { until = std::min(until, frontier); break; }
+        }
         for (const std::uint32_t frontier : r.shared_at) {
             if (frontier > r.prefilled) {
                 until = std::min(until, frontier);
@@ -1569,6 +1715,7 @@ struct Inkling2Core::Impl {
     }
 
     void finish(const std::shared_ptr<Request>& request, FinishReason reason) {
+        instance.executor->publish_mapped_stats();
         save_expert_profile();
         Request& r = *request;
         GenerationResult result;
@@ -1671,7 +1818,12 @@ struct Inkling2Core::Impl {
             std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
             store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::SharedStablePrefix);
         }
-        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at && r.prefilled < prompt_n) {
+        if (reuse_prefixes && r.reusable &&
+            std::binary_search(r.private_at.begin(), r.private_at.end(), r.prefilled)) {
+            store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateLongAnchor,
+                        r.cache_owner, r.prefilled != r.private_at.back());
+        }
+        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at) {
             executor.snapshot(r.slot, slot.snapshot);
             slot.anchor       = slot.fed;
             slot.anchor_media = slot.media;
@@ -1756,6 +1908,7 @@ struct Inkling2Core::Impl {
                     throw std::logic_error("a branched read lost the state at its prompt's end");
                 }
                 executor.restore(r.slot, slot.snapshot);
+                slot.parent_frontier = std::min(slot.parent_frontier, slot.snapshot.position);
                 slot.fed   = slot.anchor;
                 slot.media = slot.anchor_media;
             }
@@ -1776,6 +1929,7 @@ struct Inkling2Core::Impl {
                     throw std::logic_error("a branched read lost the state at its prompt's end");
                 }
                 executor.restore(r.slot, slot.snapshot);
+                slot.parent_frontier = std::min(slot.parent_frontier, slot.snapshot.position);
                 slot.fed   = slot.anchor;
                 slot.media = slot.anchor_media;
             }
@@ -2595,6 +2749,8 @@ struct Inkling2Core::Impl {
         const std::uint32_t chunk = std::min<std::uint32_t>(
             executor.options().prefill_chunk, models::inkling2::Executor::kMaxLogitRows);
         executor.reset(0);
+        slots[0].parent_image = 0;
+        slots[0].parent_frontier = 0;
         slots[0].fed.clear();
         slots[0].anchor.clear();
         slots[0].media.clear();
@@ -2825,6 +2981,28 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
                 request->shared_at.push_back(frontier);
             }
         }
+        if (data.context_cache.session_key) {
+            request->cache_owner = data.context_cache.session_key->view();
+        }
+        if (!request->cache_owner.empty() && request->reusable && !request->disposable &&
+            impl_->host_budget && impl_->long_anchor_limit && request->anchor_at > 2 * Impl::kMinStoredTokens) {
+            // One near-tail anchor protects edits within the final message. Earlier checkpoints
+            // are taken on chunk boundaries and use the same exact tokens and media identity.
+            const auto chunk = impl_->instance.executor->options().prefill_chunk;
+            const auto last = request->anchor_at - 1;
+            const auto tail_anchor = last / 256 * 256;
+            request->private_at.push_back(tail_anchor);
+            if (impl_->long_anchor_limit > 1) {
+                const auto half = tail_anchor / 2;
+                auto middle = ((half + chunk / 2) / chunk) * chunk;
+                if (middle < Impl::kMinStoredTokens || middle >= tail_anchor) {
+                    middle = half / 256 * 256;
+                }
+                if (middle >= Impl::kMinStoredTokens && middle < tail_anchor) {
+                    request->private_at.insert(request->private_at.begin(), middle);
+                }
+            }
+        }
         std::sort(request->shared_at.begin(), request->shared_at.end());
         request->shared_at.erase(std::unique(request->shared_at.begin(), request->shared_at.end()),
                                  request->shared_at.end());
@@ -2942,7 +3120,7 @@ MemorySummary Inkling2Core::memory_summary() const {
     out.device      = impl_->device.rank(0).device;
     out.max_context = impl_->max_context;
     out.kv_capacity = impl_->max_context;
-    out.kv_cache    = impl_->kv_cache; // F16 rows either way
+    out.kv_cache    = impl_->kv_cache;
     out.host_kv_capacity_bytes = impl_->host_budget;
     {
         std::lock_guard lock(impl_->stats_mutex);

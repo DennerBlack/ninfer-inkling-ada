@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #pragma once
 
 #include "core/device.h"
@@ -35,7 +37,7 @@ public:
     // For a kernel that publishes the request itself (handshake::publish, cuda_host_handshake.cuh).
     [[nodiscard]] handshake::DeviceMailbox device() const noexcept;
     void resume();
-    void wait_prepared(cudaStream_t stream);
+    void wait_prepared(cudaStream_t stream, cudaEvent_t published = nullptr);
     void wait_completed(cudaStream_t stream);
     void retire(cudaStream_t stream);
 

@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "serve/request_log.h"
 #include "product/logging/pretty_format.h"
 #include "product/reasoning_loop_options.h"
@@ -139,6 +141,8 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "bf16";
     case ninfer::KvCacheStorage::Float16:
         return "fp16";
+    case ninfer::KvCacheStorage::InklingQ4_0:
+        return "q4_0";
     case ninfer::KvCacheStorage::Int8Group64:
         return "int8-group64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:

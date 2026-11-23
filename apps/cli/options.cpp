@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "options.h"
 #include "product/kv_resident_options.h"
 #include "product/launch_config/launch_config.h"
@@ -116,6 +118,7 @@ float parse_float(const char* text, std::string_view label, float minimum, float
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "fp16") { return KvCacheStorage::Float16; }
+    if (text == "q4_0") { return KvCacheStorage::InklingQ4_0; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
     if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     // RotorQuant rk8v4: rotated INT8 keys with a packed signed int4 value plane. Opt-in.
@@ -241,7 +244,8 @@ std::string usage_text(const char* argv0) {
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  bf16 (default), int8, fp8, rk8v4, rk4v4,\n"
            "                                rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
-           "                                fp16: Flash-Next, Gemma 4 and Flint\n" +
+           "                                fp16: Flash-Next, Gemma 4, Flint and Inkling 2;\n"
+           "                                q4_0: Inkling 2 full attention (F16 sliding)\n" +
            std::string(product::kKvResidentHelp) +
            "\n"
            "SPECULATIVE DECODING\n"

@@ -1,7 +1,9 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #pragma once
 
 // The forward pass of Inkling 2 over a loaded Model: 48 visits of its 24 stored layers (the
-// prelude, the looped core three times, the coda), each visit with its own F16 keys and values
+// prelude, the looped core three times, the coda), each visit with its own keys and values
 // and its own short-convolution history. A sliding-window visit keeps a ring of the last window
 // (and a round's drafts) per sequence, a full-attention visit every position. Every visit's
 // convolution sites keep a ring of their last kHistory raw inputs (FP32) per sequence. Prompt
@@ -49,6 +51,9 @@ struct ExecutorOptions {
     std::uint32_t prefill_chunk = 2048; // prompt tokens per forward()
     std::uint32_t sequences     = 1;
     bool cuda_graphs            = true;
+    // Full-attention rows can be packed while the short sliding and staging rings stay F16.
+    bool packed_q4 = false;
+    bool mapped_misses = false;
     // Proposed tokens a verification may carry per sequence after its anchor (0: no
     // verification); a verification's rows, the anchors and drafts of all its sequences, are at
     // most 8.
@@ -125,6 +130,7 @@ public:
     Executor& operator=(const Executor&) = delete;
 
     [[nodiscard]] const ExecutorOptions& options() const noexcept;
+    [[nodiscard]] bool target_graphs_enabled() const noexcept;
     [[nodiscard]] ExecutorMemory memory() const noexcept;
     // Logit rows of a column: the unpadded vocabulary.
     [[nodiscard]] std::uint32_t vocab() const noexcept;
@@ -133,6 +139,7 @@ public:
     // Loads the kernels every route reaches, and captures the decode graphs.
     void warm_up();
     void check_experts() const;
+    void publish_mapped_stats();
     [[nodiscard]] ExpertDeliveryStats expert_stats() const;
     [[nodiscard]] ExpertRouteCounts expert_totals() const;
     [[nodiscard]] std::string expert_cpu_description() const;
@@ -180,8 +187,9 @@ public:
     // round's drafts).
     bool rewind(std::uint32_t sequence, std::uint32_t tokens);
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
+    [[nodiscard]] std::uint64_t shareable_image_bytes(std::uint32_t position) const;
     SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
-                             std::span<std::byte* const> pages, std::size_t page_bytes);
+                             std::span<std::byte* const> pages, std::size_t page_bytes, std::size_t shared_pages = 0);
     void load_image(std::uint32_t sequence, const SequenceImage& image,
                     std::span<std::byte* const> pages, std::size_t page_bytes);
 

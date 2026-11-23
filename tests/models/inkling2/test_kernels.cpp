@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 // Inkling 2's own kernels against FP64 oracles at Inkling-2-Mini's shapes (hidden 2304, 24 query
 // heads over 8 of width 128 with 16-wide relative features, a 1024-position window, 128 experts
 // choosing 8 of width 1152):
@@ -40,6 +42,7 @@
 #include "models/inkling2/situ.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
+#include "q4_oracle.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -533,7 +536,8 @@ int source_row(const RowsCase& c, int t, int lag) {
 
 int physical(const RowsCase& c, int t) { return c.chunk ? c.first + t : c.positions[t]; }
 
-void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19937& rng) {
+void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19937& rng,
+             bool packed = false) {
     const int t = int(c.positions.size());
     const int sequences = c.sequences.empty() ? 1 : *std::max_element(c.sequences.begin(), c.sequences.end()) + 1;
     const int channels = kKv * kD;
@@ -548,7 +552,8 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
     const std::int64_t seq_hist = std::int64_t(kSlots) * channels;
     const auto k_hist = normal(std::size_t(sequences) * seq_hist, 1.5f, rng);
     const auto v_hist = normal(std::size_t(sequences) * seq_hist, 1.5f, rng);
-    const std::int64_t head_stride = std::int64_t(ring) * kD, seq_stride = head_stride * kKv;
+    const int row_units = packed ? kD / 32 * sizeof(q4_oracle::Block) / 2 : kD;
+    const std::int64_t head_stride = std::int64_t(ring) * row_units, seq_stride = head_stride * kKv;
     DeviceBuffer d_kv = upload(kv), d_kt = upload(k_taps), d_vt = upload(v_taps),
                  d_kc = upload(k_conv), d_vc = upload(v_conv), d_kh = upload(k_hist),
                  d_vh = upload(v_hist), kc(std::size_t(sequences) * seq_stride * 2),
@@ -575,6 +580,7 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
     a.v_cache     = as<__half>(vc);
     a.seq_stride  = seq_stride;
     a.head_stride = head_stride;
+    a.packed_q4   = packed;
     a.ring        = 0;
     k::kv_post(a, nullptr);
     sync("kv_post");
@@ -617,10 +623,28 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
             const double f = std::min(1.0, kQkClip / (std::sqrt(n) + 1e-6));
             clipped += f < 1.0 ? 1 : 0;
             const double vs = rms_scale(vv.data(), kD, kEps);
-            const std::int64_t at = s * seq_stride + h * head_stride + std::int64_t(physical(c, r)) * kD;
-            for (int d = 0; d < kD; ++d) {
-                ek.add(__half2float(got_k[at + d]), kk[d] * f);
-                ev.add(__half2float(got_v[at + d]), vv[d] * vs);
+            const std::int64_t at = s * seq_stride + h * head_stride +
+                                    std::int64_t(physical(c, r)) * row_units;
+            if (packed) {
+                for (int base = 0; base < kD; base += 32) {
+                    const auto ref_k = q4_oracle::encode([&](int i) { return float(kk[base + i] * f); });
+                    const auto ref_v = q4_oracle::encode([&](int i) { return float(vv[base + i] * vs); });
+                    q4_oracle::Block actual_k, actual_v;
+                    const std::size_t offset = at + base / 32 * sizeof(actual_k) / 2;
+                    std::memcpy(&actual_k, got_k.data() + offset, sizeof(actual_k));
+                    std::memcpy(&actual_v, got_v.data() + offset, sizeof(actual_v));
+                    for (int i = 0; i < 32; ++i) {
+                        ek.add(__half2float(q4_oracle::decode(actual_k, i)),
+                               __half2float(q4_oracle::decode(ref_k, i)));
+                        ev.add(__half2float(q4_oracle::decode(actual_v, i)),
+                               __half2float(q4_oracle::decode(ref_v, i)));
+                    }
+                }
+            } else {
+                for (int d = 0; d < kD; ++d) {
+                    ek.add(__half2float(got_k[at + d]), kk[d] * f);
+                    ev.add(__half2float(got_v[at + d]), vv[d] * vs);
+                }
             }
         }
         if (!c.chunk) {
@@ -632,7 +656,8 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
         }
     }
     report(ek.rel() < 1e-3 && ev.rel() < 1e-3 && kept_wrong == 0,
-           "kv_post " + name + (dynamic ? " with dynamic taps" : "") + ", " + std::to_string(clipped) +
+           "kv_post " + name + (packed ? " Q4_0" : "") + (dynamic ? " with dynamic taps" : "") +
+               ", " + std::to_string(clipped) +
                " clipped heads: K " + num(ek.rel()) + ", V " + num(ev.rel()) +
                (c.chunk ? "" : ", history values wrong " + std::to_string(kept_wrong)));
 }
@@ -646,7 +671,7 @@ struct AttentionCase {
     float sink_offset = 0.0f;
 };
 
-void attention_case(const AttentionCase& c, std::mt19937& rng) {
+void attention_case(const AttentionCase& c, std::mt19937& rng, bool packed = false) {
     const RowsCase& rc = c.rows;
     const int t = int(rc.positions.size());
     const int sequences = rc.sequences.empty() ? 1 : *std::max_element(rc.sequences.begin(), rc.sequences.end()) + 1;
@@ -668,7 +693,10 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
     auto sinks      = normal(std::size_t(t) * sink_stride, 2.0f, rng);
     for (auto& v : sinks) { v += c.sink_offset; }
     const float scale = 1.0f / std::sqrt(float(kD));
-    DeviceBuffer dk = upload(kc), dv = upload(vc), dq = upload(q), dr = upload(r), dt = upload(table),
+    const auto cache_plane = [packed](std::vector<__half>& values) {
+        return packed ? upload(q4_oracle::encode_plane(values)) : upload(values);
+    };
+    DeviceBuffer dk = cache_plane(kc), dv = cache_plane(vc), dq = upload(q), dr = upload(r), dt = upload(table),
                  dg = upload(gate), ds = upload(sinks),
                  partial(k::attention_workspace_floats(t, kHeads, c.splits) * 4),
                  out(std::size_t(t) * kHeads * kD * 2),
@@ -684,8 +712,11 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
     a.extent      = kExtent;
     a.k_cache     = as<__half>(dk);
     a.v_cache     = as<__half>(dv);
-    a.seq_stride  = seq_stride;
-    a.head_stride = head_stride;
+    a.head_stride = packed ? std::int64_t(slots) * kD / 32 * sizeof(q4_oracle::Block) / 2
+                           : head_stride;
+    a.seq_stride  = a.head_stride * kKv;
+    a.packed_q4   = packed;
+    a.shared_verify_cache = packed && !rc.chunk && sequences == 1 && t > 1 && !c.window;
     a.ring        = c.ring;
     a.window      = c.window;
     a.query_heads = kHeads;
@@ -764,7 +795,7 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
         }
     }
     report(eb.rel() < 6e-3 && eq.rel() < 1.5e-2,
-           "attention " + c.name + ", splits " + std::to_string(c.splits) +
+           "attention " + c.name + (packed ? " Q4_0" : "") + ", splits " + std::to_string(c.splits) +
                (c.sink_offset != 0.0f ? ", sinks " + num(c.sink_offset) : "") + " (" +
                std::to_string(biased) + " biased, " + std::to_string(unbiased) +
                " unbiased scores): bf16 " + num(eb.rel()) + ", q8_1 " + num(eq.rel()));
@@ -1421,6 +1452,58 @@ std::vector<int> iota(int first, int count) {
 
 } // namespace
 
+void recurrent_expert_case() {
+    constexpr int n = 4, up = 3, down = 2, stride = 4;
+    std::vector<uint4> raw(2 * n * 2 * stride);
+    for (unsigned i = 0; i < raw.size(); ++i) { raw[i] = make_uint4(i + 1, 3 * i, 5 * i, 7 * i); }
+    auto data = upload(raw);
+    auto slots = upload(std::vector<uint4>(n * 2 * stride));
+    auto tags = upload(std::vector<int>(n, -1));
+    auto list = upload(std::vector<int>{3, 0, 1}), num = upload(std::vector<int>{3});
+    auto bounds = upload(std::vector<int>{0, 1, 3, 3, 5});
+    auto misses = upload(std::vector<int>(n + 1));
+    auto tables = upload(std::vector<const void*>(2 * n));
+    auto stats = upload(std::vector<k::MappedCounts>(1));
+    k::RecurrentExpertCache cache{as<uint4>(slots), as<int>(tags), n, 2 * stride};
+    std::array<int, n> expected_tags{-1,-1,-1,-1};
+    size_t wanted_pairs = 0, wanted_hits = 0, wanted_bytes = 0;
+    bool ok = true;
+    for (int layer : {0,0,1,0,0}) {
+        std::vector<k::MappedExpert> desc(n);
+        for (int e = 0; e < n; ++e) {
+            for (int b = 0; b < 2; ++b) {
+                const auto* ptr = as<uint4>(data) + ((layer*n + e)*2 + b)*stride;
+                desc[e].host[b] = ptr;
+                if (e == 0) { desc[e].resident[b] = ptr; }
+            }
+        }
+        auto source = upload(desc);
+        k::gather_recurrent(as<k::MappedExpert>(source), as<int>(list), as<int>(num),
+            as<int>(bounds), n, layer, cache, as<int>(misses), up, down, stride, stride,
+            as<const void*>(tables), as<k::MappedCounts>(stats), nullptr);
+        sync("recurrent gather");
+        const auto table = download<const void*>(tables, 2*n);
+        for (int e : {3,0,1}) {
+            const auto pairs = e == 0 ? 1 : 2;
+            const auto key = layer*n + e, slot = (layer*53 + e) % n;
+            wanted_pairs += pairs;
+            if (e == 0 || expected_tags[slot] == key) { wanted_hits += pairs; }
+            else { wanted_bytes += (up + down) * sizeof(uint4); expected_tags[slot] = key; }
+            for (int b = 0; b < 2; ++b) {
+                std::array<uint4, stride> actual{};
+                check(cudaMemcpy(actual.data(), table[b*n + e], sizeof(actual), cudaMemcpyDeviceToHost), "read selected expert");
+                for (int j = 0; j < stride; ++j) {
+                    const auto want = e == 0 || j < (b ? down : up) ? raw[((layer*n + e)*2 + b)*stride + j] : make_uint4(0,0,0,0);
+                    ok = ok && std::memcmp(&want, &actual[j], sizeof(want)) == 0;
+                }
+            }
+        }
+        const auto measured = download<k::MappedCounts>(stats, 1)[0];
+        ok = ok && measured.pairs == wanted_pairs && measured.hits == wanted_hits && measured.bytes == wanted_bytes;
+    }
+    report(ok, "recurrent expert cache: original rows, padding, permanent hits, layer collisions and PCIe byte count");
+}
+
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
@@ -1465,6 +1548,8 @@ int main() {
             kv_case("chunk at position 0", origin, dynamic, rng);
             kv_case("branches", branches, dynamic, rng);
         }
+        kv_case("chunk at position 0", origin, true, rng, true);
+        kv_case("verification rows", verify, true, rng, true);
 
         const int ring = kWindow + 64;
         attention_case({"window ring, decode", {{5, 1100, 3000}, {0, 1, 2}}, ring, kWindow, 1}, rng);
@@ -1480,6 +1565,14 @@ int main() {
         attention_case({"full cache, chunk at 0", {iota(0, 64), {}, true, 0}, 0, 0, 1}, rng);
         attention_case({"full cache, branches", branches, 0, 0, 1}, rng);
         attention_case({"window ring, branches", branches, ring, kWindow, 1}, rng);
+        attention_case({"full cache, decode", {{0, 900, 1500}, {0, 1, 2}}, 0, 0, 48}, rng, true);
+        attention_case({"full cache, branches", branches, 0, 0, 1}, rng, true);
+        attention_case({"full cache, changing split count and finite sink", {{15,16,17},{0,0,0}}, 0,0,20,4.0f},rng,true);
+        attention_case({"full cache, shared verify across split", {{319,320,321},{0,0,0}}, 0,0,20},rng,true);
+        attention_case({"full cache, shared verify long", {{8191,8192,8193},{0,0,0}}, 0,0,20},rng,true);
+        attention_case({"full cache, tensor core chunk after 1200", {iota(1200, 65), {}, true, 1200}, 0, 0, 1}, rng, true);
+        attention_case({"window ring, tensor core after wrap", {iota(2100, 35), {}, true, 2100}, ring, kWindow, 1}, rng);
+
 
         residual_case("decode rows", decode, Product::Plain, false, 0, rng);
         residual_case("verification rows", verify, Product::Fixed, false, 3, rng);
@@ -1488,6 +1581,7 @@ int main() {
         residual_case("prompt chunk", chunk, Product::Fixed, false, 1, rng);
         residual_case("chunk at position 0", origin, Product::Pairs, false, 0, rng);
 
+        recurrent_expert_case();
         route_case(1, false, rng);
         route_case(3, true, rng);
         route_case(8, false, rng);

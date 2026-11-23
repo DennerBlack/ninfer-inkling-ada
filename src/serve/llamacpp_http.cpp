@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 // llama.cpp's native server endpoints -- POST /tokenize, /detokenize, /apply-template, /completion
 // and /rerank -- and OpenAI's legacy POST /v1/completions, which shares the raw-prompt completion.
 
@@ -408,6 +410,7 @@ void HttpServer::handle_text_completion(const httplib::Request& req, httplib::Re
         const bool return_progress = request.response.return_progress;
         const bool live_timings    = llama || request.response.timings_per_token;
         auto stream                = std::make_shared<HttpGenerationStream>(std::move(prepared));
+        bind_stream_stop(req, std::shared_ptr<std::atomic<bool>>(stream, &stream->cancelled));
         auto encoder               = std::make_shared<TextCompletionStream>(std::move(context));
 
         prepare_sse_response(res);

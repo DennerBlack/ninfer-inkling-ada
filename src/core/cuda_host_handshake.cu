@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "core/cuda_host_handshake.h"
 
 #include "core/cuda_host_handshake.cuh"
@@ -76,13 +78,13 @@ void CudaHostHandshake::publish(std::uint32_t tag, std::uint32_t width, std::uin
     publish_request<<<1, 1, 0, stream>>>(device(), tag, width, flags);
     CUDA_CHECK(cudaGetLastError());
 }
-void CudaHostHandshake::wait_prepared(cudaStream_t stream) {
+void CudaHostHandshake::wait_prepared(cudaStream_t stream, cudaEvent_t published) {
     if (!capturing(stream)) {
         // A later first-use kernel can make lazy loading synchronize the CUDA context while
         // holding its driver lock. A running GPU wait would then block both that load and the
         // worker's DMA calls. Eager execution waits on the host; graph capture loads its whole
         // kernel set before any wait runs.
-        CUDA_CHECK(ninfer::wait_for_stream(stream));
+        CUDA_CHECK(published ? ninfer::wait_for_event(published) : ninfer::wait_for_stream(stream));
         wait_host(*static_cast<Mailbox*>(host_), false);
         return;
     }

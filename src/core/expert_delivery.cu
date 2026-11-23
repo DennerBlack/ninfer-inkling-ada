@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "core/expert_delivery.h"
 
 #include "core/cpu_spin_pool.h"
@@ -118,6 +120,7 @@ struct Storage {
 
 // Device ranges a call hands the host service (the CPU's operands), into mapped host memory: the
 // pairs' expert ids, then up to kCpuInputs inputs of the family's.
+constexpr std::uint32_t kEagerCopyEvent = 1u << 1;
 constexpr int kCpuInputs = 3;
 struct HostCopies {
     const std::byte* source[1 + kCpuInputs]{};
@@ -137,7 +140,8 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
                              const std::uintptr_t* lent, std::int32_t* cached,
                              std::int32_t* missing, std::int32_t* cached_experts,
                              std::int32_t* missing_experts, std::uint32_t* needed,
-                             HostCopies copies, handshake::DeviceMailbox mailbox, std::uint32_t tag,
+                             const std::int32_t* sorted_bounds, HostCopies copies,
+                             handshake::DeviceMailbox mailbox, std::uint32_t tag,
                              std::uint32_t flags) {
     extern __shared__ std::uint32_t counts[];
     __shared__ std::uint32_t routes, sets[2][32], listed[2];
@@ -145,24 +149,35 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
         routes    = 0;
         listed[0] = listed[1] = 0;
     }
-    for (int e = threadIdx.x; e < experts; e += blockDim.x) { counts[e] = 0; }
-    __syncthreads();
-    for (std::uint32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
-        const int e = ids[p];
-        if (e >= 0 && e < experts) { atomicAdd(counts + e, 1u); }
+    bool wide = false;
+    if (sorted_bounds) {
+        // The short Inkling router already groups the pairs. This launch is restricted
+        // to fewer than half as many pairs as experts, so it cannot reclaim the lent bank.
+        for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+            counts[e] = sorted_bounds[e + 1] - sorted_bounds[e];
+        }
+        __syncthreads();
+    } else {
+        for (int e = threadIdx.x; e < experts; e += blockDim.x) { counts[e] = 0; }
+        __syncthreads();
+        for (std::uint32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
+            const int e = ids[p];
+            if (e >= 0 && e < experts) { atomicAdd(counts + e, 1u); }
+        }
+        __syncthreads();
+        for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+            if (counts[e]) { atomicAdd(&routes, 1u); }
+        }
+        __syncthreads();
+        wide = 2 * routes >= std::uint32_t(experts);
     }
-    __syncthreads();
-    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-        if (counts[e]) { atomicAdd(&routes, 1u); }
-    }
-    __syncthreads();
-    const bool wide = 2 * routes >= std::uint32_t(experts);
     const std::uintptr_t lent_low[2]{lent[0], lent[2]}, lent_high[2]{lent[1], lent[3]};
     const auto hit = [&](const void* entry) {
         const auto address = reinterpret_cast<std::uintptr_t>(entry);
         if (address >= low && address < high) { return true; }
         return !wide && ((address >= lent_low[0] && address < lent_high[0]) ||
-                         (address >= lent_low[1] && address < lent_high[1]));
+                         (address >= lent_low[1] && address < lent_high[1]) ||
+                         (address >= lent[4] && address < lent[5]));
     };
     // Each warp ballots its experts of a block-wide pass; earlier warps and passes place them.
     // A routed expert's count keeps its hit in the top bit for the pairs below.
@@ -299,7 +314,7 @@ struct ExpertDelivery::Impl {
         std::vector<std::uint64_t> offset, size; // per blob, within a slot
         std::uint64_t slot_bytes = 0, base = 0, span = 0;
         std::int32_t first     = 0;
-        std::uint32_t capacity = 0, count = 0, layers = 0;
+        std::uint32_t capacity = 0, count = 0, layers = 0, cache_weight = 1;
         std::vector<std::int32_t> free; // popped lowest first
     };
     struct Deferred {
@@ -347,6 +362,8 @@ struct ExpertDelivery::Impl {
     // served calls' count.
     std::vector<LentSlot> lent_slots;
     std::uint32_t per_bank = 0;
+    std::byte* borrowed_workspace = nullptr;
+    std::size_t fixed_lent_count() const { return std::size_t(per_bank) * banks.size(); }
     std::vector<unsigned char> bank_lent;
     Storage lent_ranges;
     std::unique_ptr<PinnedHostBuffer> host_ranges;
@@ -365,6 +382,12 @@ struct ExpertDelivery::Impl {
     cudaStream_t rounds = nullptr;
     std::vector<cudaEvent_t> spare_events;
     std::unique_ptr<PinnedHostBuffer> round_staging; // disk experts: a call's round reads
+    cudaEvent_t copy_ready = nullptr;
+    std::atomic<bool> all_cached{false};
+    bool wait_copy_ready = false; // compute thread, from begin to await
+    std::ofstream route_trace;
+    std::uint32_t trace_remaining = 0;
+    cudaEvent_t local_round_ready = nullptr;
     cudaEvent_t round_staged = nullptr;               // the staging's last copies
     // A CPU share: the pool, the split, the call's inputs and ids on the host, the CPU's
     // products and flag, the corrected missing ids, and disk experts' bytes read for the CPU.
@@ -375,6 +398,7 @@ struct ExpertDelivery::Impl {
     void* host_ids_mapped    = nullptr;
     Storage products, cpu_flag;
     std::vector<std::byte> cpu_bytes;
+    cudaEvent_t request_published = nullptr;
     cudaEvent_t copies_begun = nullptr, copies_done = nullptr; // a call's copies, timed
     bool spinning = false;
     std::optional<CudaHostHandshake> handshake;
@@ -421,6 +445,11 @@ struct ExpertDelivery::Impl {
          std::vector<ExpertDeliveryLayer> specs, ExpertDeliveryOptions o)
         : rank(r), options(o) {
         DeviceBinding bind(rank.device);
+        if (options.route_trace_path) {
+            route_trace.open(options.route_trace_path, std::ios::binary | std::ios::trunc);
+            if (!route_trace) { throw std::runtime_error("could not open expert route trace"); }
+            trace_remaining = 32768;
+        }
         if (specs.empty() || options.pair_capacity == 0) {
             throw std::invalid_argument("expert delivery: layers and pair capacity are required");
         }
@@ -515,11 +544,12 @@ struct ExpertDelivery::Impl {
             layer.cpu = options.cpu.products != nullptr && options.cpu.products->supports(index);
             layer.pool = std::uint32_t(
                 std::find_if(pools.begin(), pools.end(),
-                             [&](const Pool& pool) { return pool.size == rooms[index]; }) -
+                             [&](const Pool& pool) { return pool.size == rooms[index] && pool.cache_weight == spec.cache_weight; }) -
                 pools.begin());
             if (layer.pool == pools.size()) {
                 auto& pool = pools.emplace_back();
                 pool.size  = rooms[index];
+                pool.cache_weight = spec.cache_weight;
                 for (const auto size : pool.size) {
                     pool.offset.push_back(pool.slot_bytes);
                     pool.slot_bytes = checked_add(pool.slot_bytes, size);
@@ -631,7 +661,7 @@ struct ExpertDelivery::Impl {
         // last one, and an explicit cache keeps its size by dropping the second bank first.
         std::uint32_t bank_count = options.banks;
         std::uint64_t explicit_cache = 0;
-        if (options.cache_bytes) {
+        if (options.cache_bytes && !options.cache_bytes_are_limit) {
             const auto counts =
                 fill_pools(*options.cache_bytes, std::vector<std::uint32_t>(pools.size(), 0));
             for (std::size_t p = 0; p < pools.size(); ++p) {
@@ -664,16 +694,26 @@ struct ExpertDelivery::Impl {
             lent_slots.resize(std::size_t(per_bank) * bank_count);
             for (auto& slot : lent_slots) { slot.written.assign(slot_offset.size(), 0); }
         }
-        lent_ranges = Storage(4 * sizeof(std::uintptr_t), rank.device, options.suspendable);
+        lent_ranges = Storage(6 * sizeof(std::uintptr_t), rank.device, options.suspendable);
         lent_ranges.fill();
-        host_ranges = std::make_unique<PinnedHostBuffer>(4 * sizeof(std::uintptr_t));
+        host_ranges = std::make_unique<PinnedHostBuffer>(6 * sizeof(std::uintptr_t));
         std::memset(host_ranges->data(), 0, host_ranges->size());
         allocation.metadata_bytes += lent_ranges.backing_bytes();
         allocation.pinned_bytes += host_ranges->size();
-        const std::uint64_t remaining = available();
+        std::uint64_t remaining = available();
+        if (options.local_budget_remaining) {
+            if (const auto room = options.local_budget_remaining(rank.device)) {
+                const auto resident = *room > options.keep_free_bytes ? *room - options.keep_free_bytes : 0;
+                remaining = std::min(remaining, resident);
+            }
+        }
         // Automatic slots may use only whole physical granules inside the remaining budget.
         // An explicit request must preserve the same reserve, including VMM rounding.
-        const auto budget = options.cache_bytes.value_or(remaining / cache_granule * cache_granule);
+        const std::uint64_t available_budget = remaining / cache_granule * cache_granule;
+        const std::uint64_t requested = options.cache_bytes.value_or(available_budget);
+        const auto budget = options.cache_bytes_are_limit
+            ? std::min(requested, remaining) / cache_granule * cache_granule
+            : requested;
         const auto counts = fill_pools(budget, std::vector<std::uint32_t>(pools.size(), 0));
         std::uint64_t cache_bytes = 0, reserve = 0;
         std::int32_t first = 0;
@@ -774,13 +814,22 @@ struct ExpertDelivery::Impl {
         CUDA_CHECK(cudaStreamCreateWithFlags(&rounds, cudaStreamNonBlocking));
         try {
             for (auto& event : copied) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
+            if (options.eager_copy_event) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&copy_ready, cudaEventDisableTiming));
+            }
+            if (options.overlap_cached_products || options.eager_copy_event) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&request_published, cudaEventDisableTiming));
+            }
+            if (options.promote_lent_on_device) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&local_round_ready, cudaEventDisableTiming));
+            }
             CUDA_CHECK(cudaEventCreateWithFlags(&round_staged, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreate(&copies_begun));
             CUDA_CHECK(cudaEventCreate(&copies_done));
             service = std::thread([this] { run(); });
         } catch (...) {
             for (auto event : copied) { if (event) { cudaEventDestroy(event); } }
-            for (auto event : {round_staged, copies_begun, copies_done}) {
+            for (auto event : {request_published, copy_ready, local_round_ready, round_staged, copies_begun, copies_done}) {
                 if (event) { cudaEventDestroy(event); }
             }
             cudaStreamDestroy(copies);
@@ -808,6 +857,9 @@ struct ExpertDelivery::Impl {
             }
         }
         for (auto event : spare_events) { cudaEventDestroy(event); }
+        if (request_published) { cudaEventDestroy(request_published); }
+        if (copy_ready) { cudaEventDestroy(copy_ready); }
+        if (local_round_ready) { cudaEventDestroy(local_round_ready); }
         for (auto event : {round_staged, copies_begun, copies_done}) { cudaEventDestroy(event); }
         cudaStreamDestroy(copies);
         cudaStreamDestroy(rounds);
@@ -868,7 +920,8 @@ struct ExpertDelivery::Impl {
     // pool first among equals).
     [[nodiscard]] bool fewer(std::size_t a, std::uint32_t na, std::size_t b,
                              std::uint32_t nb) const {
-        const auto x = std::uint64_t(na) * pools[b].layers, y = std::uint64_t(nb) * pools[a].layers;
+        const auto x = std::uint64_t(na) * pools[b].layers * pools[b].cache_weight;
+        const auto y = std::uint64_t(nb) * pools[a].layers * pools[a].cache_weight;
         return x != y ? x < y : a < b;
     }
 
@@ -953,6 +1006,9 @@ struct ExpertDelivery::Impl {
         point(li, e, [](std::size_t) { return static_cast<std::byte*>(nullptr); });
     }
     [[nodiscard]] std::byte* lent_base(std::int32_t l) const {
+        if (std::size_t(l) >= fixed_lent_count()) {
+            return borrowed_workspace + (std::size_t(l) - fixed_lent_count()) * slot_bytes;
+        }
         const auto bank = std::uint32_t(l) / per_bank;
         return static_cast<std::byte*>(banks[bank].p) + std::uint64_t(std::uint32_t(l) % per_bank) * slot_bytes;
     }
@@ -1011,11 +1067,11 @@ struct ExpertDelivery::Impl {
         std::uint32_t lent = 0;
         for (const auto flag : bank_lent) { lent += flag ? per_bank : 0; }
         std::lock_guard lock(mutex);
-        allocation.lent_slots = lent;
+        allocation.lent_slots = lent + std::uint32_t(lent_slots.size() - fixed_lent_count());
     }
 
     [[nodiscard]] bool any_lent() const {
-        return std::any_of(bank_lent.begin(), bank_lent.end(), [](unsigned char flag) { return flag != 0; });
+        return borrowed_workspace || std::any_of(bank_lent.begin(), bank_lent.end(), [](unsigned char flag) { return flag != 0; });
     }
 
     // The lent slot a narrow call of layer li fills next, other than those it took (`taken`): a
@@ -1026,9 +1082,11 @@ struct ExpertDelivery::Impl {
                                          std::span<const std::int32_t> taken) const {
         std::int32_t best = -1;
         std::tuple<int, float, std::uint64_t> best_key{};
-        for (std::size_t k = 0; k < bank_lent.size(); ++k) {
-            if (!bank_lent[k]) { continue; }
-            for (std::uint32_t i = 0; i < per_bank; ++i) {
+        for (std::size_t k = 0; k <= bank_lent.size(); ++k) {
+            const bool external = k == bank_lent.size();
+            if (external ? !borrowed_workspace : !bank_lent[k]) { continue; }
+            const auto count = external ? lent_slots.size() - fixed_lent_count() : per_bank;
+            for (std::size_t i = 0; i < count; ++i) {
                 const auto l = std::int32_t(k * per_bank + i);
                 const auto& slot = lent_slots[std::size_t(l)];
                 if (slot.layer == std::int32_t(li) && call_routed[std::size_t(slot.expert)]) { continue; }
@@ -1371,6 +1429,7 @@ struct ExpertDelivery::Impl {
         const cudaEvent_t done = take_event();
         std::uint64_t staged = 0;
         std::size_t issued = 0;
+        bool used_local = false;
         std::vector<QueuedFileRead> reads;
         std::vector<DirectRead> window_reads;
         std::vector<StagedCopy> staged_copies;
@@ -1380,7 +1439,27 @@ struct ExpertDelivery::Impl {
         const std::uint64_t room = direct ? round_window : (staging ? round_staging->size() : 0);
         for (; issued < queued.size() && issued < kRoundExperts; ++issued) {
             const auto& d = queued[issued];
-            const auto& expert = layers[d.layer].source.experts[std::size_t(d.expert)];
+            const auto& layer = layers[d.layer];
+            const auto& expert = layer.source.experts[std::size_t(d.expert)];
+            const auto lent = layer.lent_of[std::size_t(d.expert)];
+            if (local_round_ready && lent >= 0) {
+                // Lending, reclamation and future writes to this slot all use copies. A promotion
+                // scheduled here reads the original bytes before the next request can recycle them.
+                for (std::size_t b = 0; b < expert.size(); ++b) {
+                    const auto bytes = expert[b].bytes;
+                    auto* target = slot_blob(d.slot, b);
+                    CUDA_CHECK(cudaMemcpyAsync(target, lent_base(lent) + slot_offset[b], bytes,
+                                               cudaMemcpyDeviceToDevice, copies));
+                    auto& written = slots[std::size_t(d.slot)].written[b];
+                    if (written > bytes) {
+                        CUDA_CHECK(cudaMemsetAsync(target + bytes, 0, written - bytes, copies));
+                    }
+                    written = bytes;
+                    delta.promoted_bytes += bytes;
+                }
+                used_local = true;
+                continue;
+            }
             std::uint64_t file_bytes = 0;
             for (const auto& blob : expert) {
                 if (blob.pinned) { continue; }
@@ -1449,6 +1528,10 @@ struct ExpertDelivery::Impl {
                                            rounds));
             }
             CUDA_CHECK(cudaEventRecord(round_staged, rounds));
+        }
+        if (used_local) {
+            CUDA_CHECK(cudaEventRecord(local_round_ready, copies));
+            CUDA_CHECK(cudaStreamWaitEvent(rounds, local_round_ready, 0));
         }
         CUDA_CHECK(cudaEventRecord(done, rounds));
         for (std::size_t i = 0; i < issued; ++i) {
@@ -1673,6 +1756,13 @@ struct ExpertDelivery::Impl {
             }
         }
         delta.routes = routes;
+        if (trace_remaining) {
+            const std::uint32_t header[]{std::uint32_t(li), std::uint32_t(experts), request.width, routes};
+            route_trace.write(reinterpret_cast<const char*>(header), sizeof(header));
+            route_trace.write(reinterpret_cast<const char*>(needed), experts * sizeof(std::uint32_t));
+            if (!--trace_remaining) { route_trace.close(); }
+        }
+        all_cached.store(routes == delta.hits, std::memory_order_relaxed);
         const bool wide = 2 * routes >= std::uint32_t(experts);
         land(!wide);
         ++stamp;
@@ -1758,7 +1848,7 @@ struct ExpertDelivery::Impl {
         // after it, carry the round's evictions before any later layer runs.
         const auto learn = [&] {
             if (wide) { return; }
-            if (new_pass) { round(delta); }
+            if (new_pass && (!options.recurrent_passes || li == 0)) { round(delta); }
             last_narrow = std::int64_t(li);
             std::lock_guard lock(mutex);
             for (int e = 0; e < experts; ++e) {
@@ -1797,7 +1887,13 @@ struct ExpertDelivery::Impl {
             ranges_dirty = false;
         }
         upload_tables();
-        CUDA_CHECK(ninfer::wait_for_stream(copies));
+        if (request.flags & kEagerCopyEvent) {
+            // A GPU-only eager consumer can queue its dependency as soon as this event has
+            // been recorded. Captured graphs and timed CPU work keep their original barrier.
+            CUDA_CHECK(cudaEventRecord(copy_ready, copies));
+        } else {
+            CUDA_CHECK(ninfer::wait_for_stream(copies));
+        }
         if (timed) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, copies_begun, copies_done));
@@ -2075,7 +2171,8 @@ ExpertDelivery::~ExpertDelivery() = default;
 
 ExpertDelivery::Call ExpertDelivery::begin(std::size_t index, const std::int32_t* ids,
                                            std::uint32_t pairs, cudaStream_t stream,
-                                           std::span<const Input> inputs) {
+                                           std::span<const Input> inputs,
+                                           const std::int32_t* sorted_bounds) {
     auto& p = *impl_;
     p.check();
     if (p.released) { throw std::logic_error("expert delivery: device backing is released"); }
@@ -2112,18 +2209,28 @@ ExpertDelivery::Call ExpertDelivery::begin(std::size_t index, const std::int32_t
         call.products = p.products.p;
         call.cpu = static_cast<const std::int32_t*>(p.cpu_flag.p);
     }
-    split_routes<<<1, 1024, std::size_t(experts) * 4, stream>>>(
+    p.wait_copy_ready = false;
+    if (p.copy_ready && !cpu && pairs < std::uint32_t(experts) / 2) {
+        cudaStreamCaptureStatus capture;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        p.wait_copy_ready = capture == cudaStreamCaptureStatusNone;
+    }
+    const bool reuse = sorted_bounds && !cpu && 2ull * pairs < std::uint32_t(experts);
+    const unsigned threads = reuse ? std::min(1024u, (unsigned(experts) + 31) / 32 * 32) : 1024u;
+    split_routes<<<1, threads, std::size_t(experts) * 4, stream>>>(
         ids, pairs, experts, static_cast<const void* const*>(layer.tables.p), low,
         low + p.cache_span, static_cast<const std::uintptr_t*>(p.lent_ranges.p),
         static_cast<std::int32_t*>(p.cached_ids.p), static_cast<std::int32_t*>(p.missing_ids.p),
-        p.cached_experts, p.missing_experts, static_cast<std::uint32_t*>(p.needed_mapped), copies,
-        p.handshake->device(), std::uint32_t(index), cpu ? kCpuCall : 0);
+        p.cached_experts, p.missing_experts, static_cast<std::uint32_t*>(p.needed_mapped), reuse ? sorted_bounds : nullptr, copies,
+        p.handshake->device(), std::uint32_t(index), cpu ? kCpuCall : (p.wait_copy_ready ? kEagerCopyEvent : 0));
     CUDA_CHECK(cudaGetLastError());
+    if (p.request_published) { CUDA_CHECK(cudaEventRecord(p.request_published, stream)); }
     return call;
 }
 void ExpertDelivery::await(cudaStream_t stream) {
-    impl_->handshake->wait_prepared(stream);
+    impl_->handshake->wait_prepared(stream, impl_->request_published);
     impl_->check();
+    if (impl_->wait_copy_ready) { CUDA_CHECK(cudaStreamWaitEvent(stream, impl_->copy_ready, 0)); }
 }
 const void* const* ExpertDelivery::tables(std::size_t layer) const {
     return static_cast<const void* const*>(impl_->layers.at(layer).tables.p);
@@ -2137,12 +2244,22 @@ bool ExpertDelivery::alias_aligned(std::size_t layer, std::size_t alias,
     const auto& a = l.source.aliases.at(alias);
     return a.offset % bytes == 0 && l.stride.at(a.blob) % bytes == 0;
 }
+bool ExpertDelivery::all_cached() const { return impl_->all_cached.load(std::memory_order_relaxed); }
 void ExpertDelivery::check() const { impl_->check(); }
 void ExpertDelivery::drain() {
     impl_->quiesce();
     impl_->check();
 }
+const void* ExpertDelivery::resident_blob(std::size_t li, std::size_t expert, std::size_t blob) const {
+    const auto& layer = impl_->layers.at(li);
+    const int slot = layer.slot_of.at(expert);
+    if (slot >= 0 && !impl_->slots.at(slot).pending) { return impl_->slot_blob(slot, blob); }
+    const int lent = layer.lent_of.at(expert);
+    if (lent >= 0) { return impl_->lent_base(lent) + impl_->slot_offset.at(blob); }
+    return nullptr;
+}
 void ExpertDelivery::invalidate() {
+    lend_workspace(nullptr, 0);
     auto& p = *impl_;
     if (p.released) { throw std::logic_error("expert delivery: restore backing before invalidation"); }
     drain();
@@ -2315,6 +2432,37 @@ std::uint64_t ExpertDelivery::grow_cache() {
     DeviceBinding bind(p.rank.device);
     std::lock_guard lock(p.mutex);
     return p.grow();
+}
+
+void ExpertDelivery::lend_workspace(void* data, std::size_t bytes) {
+    auto& p = *impl_;
+    if (data == p.borrowed_workspace) { return; }
+    drain();
+    DeviceBinding bind(p.rank.device);
+    const auto first = p.fixed_lent_count();
+    for (auto i = first; i < p.lent_slots.size(); ++i) {
+        auto& slot = p.lent_slots[i];
+        if (slot.layer >= 0) { p.point_nowhere(std::size_t(slot.layer), slot.expert); }
+    }
+    p.lent_slots.resize(first);
+    const auto count = bytes / p.slot_bytes;
+    if (data && count) {
+        p.lent_slots.resize(first + count);
+        for (std::size_t i = first; i < p.lent_slots.size(); ++i) {
+            p.lent_slots[i].written.assign(p.slot_offset.size(), 0);
+        }
+        CUDA_CHECK(cudaMemsetAsync(data, 0, count * p.slot_bytes, p.copies));
+    }
+    p.borrowed_workspace = count ? static_cast<std::byte*>(data) : nullptr;
+    auto* ranges = static_cast<std::uintptr_t*>(p.host_ranges->data());
+    ranges[4] = reinterpret_cast<std::uintptr_t>(p.borrowed_workspace);
+    ranges[5] = ranges[4] + count * p.slot_bytes;
+    p.upload_tables();
+    CUDA_CHECK(cudaMemcpyAsync(p.lent_ranges.p, ranges, p.host_ranges->size(),
+                               cudaMemcpyHostToDevice, p.copies));
+    CUDA_CHECK(ninfer::wait_for_stream(p.copies));
+    p.ranges_dirty = false;
+    p.set_lent_count();
 }
 
 void ExpertDelivery::set_keep_free_bytes(std::uint64_t bytes) {

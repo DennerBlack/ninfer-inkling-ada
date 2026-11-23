@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "models/inkling2/model.h"
 
 #include "artifact/binder.h"
@@ -10,6 +12,8 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -217,7 +221,15 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         throw std::invalid_argument("Inkling 2 runs on one device, or divides its experts over "
                                     "several with --tensor-parallel");
     }
-    std::vector<std::array<artifact::ParameterReference, 2>> expert_references;
+    std::vector<std::pair<std::uint32_t, std::array<artifact::ParameterReference, 2>>> expert_references;
+    std::uint32_t resident_core_layers = 0;
+    if (const char* value = std::getenv("HEL_INKLING_RESIDENT_CORE_LAYERS"); value && offload) {
+        const std::string_view setting(value);
+        const auto [end, error] = std::from_chars(value, value + setting.size(), resident_core_layers);
+        if (error != std::errc{} || end != value + setting.size() || resident_core_layers > config.num_hidden_layers) {
+            throw std::invalid_argument("Invalid number of resident Inkling core layers");
+        }
+    }
     const std::uint64_t h    = config.hidden_size;
     const std::uint64_t d    = config.head_dim;
     const std::uint64_t kv   = config.num_key_value_heads;
@@ -229,12 +241,24 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         return b.direct(name, std::move(shape), QType::FP32);
     };
     TextWeights weights;
-    weights.token_embedding = b.parameter("text/token_embedding", {config.vocab_size, h});
+    const bool host_embedding = options.embedding_residency == EmbeddingResidency::Host;
+    weights.token_embedding = b.parameter("text/token_embedding", {config.vocab_size, h}, {}, {},
+                                          host_embedding ? artifact::Residency::Mapped
+                                                         : artifact::Residency::Device);
     weights.embedding_norm  = vector("text/embedding_norm", {h});
     weights.output_head     = b.parameter("text/output_head", {config.vocab_size, h},
                                           {"text/final_hidden"});
     weights.final_norm      = vector("text/final_norm", {h});
     weights.output_mix      = vector("text/output_mix", {h});
+    if (host_embedding) {
+        for (const auto& input : b.at(weights.token_embedding).reference.binding.parts) {
+            for (const auto& output : b.at(weights.output_head).reference.binding.parts) {
+                if (input.object.index == output.object.index) {
+                    throw std::invalid_argument("--embedding-residency host requires an untied Inkling token embedding");
+                }
+            }
+        }
+    }
     tail(b, weights.output_head);
     for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
         const std::string p = "text/layers/" + std::to_string(i) + "/";
@@ -278,12 +302,13 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             moe.gate_up_scale = vector(m + "gate_up_scale", {e});
         }
         if (binder.contains(m + "down_scale")) { moe.down_scale = vector(m + "down_scale", {e}); }
-        if (offload) {
+        const bool resident_core = config.core(i) && i - config.core_start < resident_core_layers;
+        if (offload && !resident_core) {
             const auto residency = options.experts == ExpertResidency::Host
                                        ? artifact::Residency::Pinned : artifact::Residency::Values;
-            expert_references.push_back({
+            expert_references.push_back({i, {
                 binder.parameter(m + "gate_up", {e * 2 * w, h}, residency),
-                binder.parameter(m + "down", {e * h, w}, residency)});
+                binder.parameter(m + "down", {e * h, w}, residency)}});
             // Uses still belong to the family contract, even without a resident operand.
             for (const auto& use : {std::pair{m + "gate_up", m + "input"},
                                     std::pair{m + "down", m + "product"}}) {
@@ -427,11 +452,13 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     info.artifact_id     = reader.artifact_id();
     auto pending         = std::move(b.weights);
     auto materialization = std::move(binder).finish();
-    auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
+    auto backing = artifact::materialize(reader, std::move(materialization), device, observer, nullptr,
+                                         {.map_pinned = options.map_pinned});
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
     std::vector<ExpertBanks> expert_banks;
-    for (const auto& reference : expert_references) {
+    for (const auto& [layer_index, reference] : expert_references) {
         ExpertBanks bank;
+        bank.layer_index = layer_index;
         auto gu = expert_blobs(reader, reference[0], backing, e, 2 * w, h, bank.gate_up_type,
                                bank.gate_up_row_bytes);
         auto down = expert_blobs(reader, reference[1], backing, e, h, w, bank.down_type,

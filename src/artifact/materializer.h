@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #pragma once
 
 #include "artifact/schema.h"
@@ -109,6 +111,7 @@ struct MaterializationStats {
 };
 
 struct MaterializeOptions {
+    bool map_pinned = false; // allow device reads of pinned expert banks
     // Device arenas at fixed addresses whose physical memory a model suspend can release; the
     // device objects are then uploaded again from `retained_reader` when the model resumes. The
     // reader keeps the artifact's files open, so the bytes it restores are the ones it loaded even

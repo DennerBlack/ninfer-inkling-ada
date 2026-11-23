@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #pragma once
 
 // Physical KV-cache storage formats (--kv-dtype). Kernels, the paged KV store and the Engine options
@@ -37,6 +39,8 @@ enum class KvCacheStorage : std::uint8_t {
     Bf16Packed,
     // Native binary16 K/V, rounded directly from FP32 cache-producing operands (Flash-Next).
     Float16,
+    // Inkling 2 full attention: GGML Q4_0 blocks of 32 with a binary16 scale.
+    InklingQ4_0,
 };
 
 } // namespace ninfer

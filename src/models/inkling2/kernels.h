@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #pragma once
 
 // Inkling 2's own kernels: the depth mixes and their norms, the loop controllers, the attention's
@@ -25,6 +27,28 @@
 #include <cstdint>
 
 namespace ninfer::models::inkling2::kernels {
+
+struct MappedExpert {
+    const uint4* host[2]{};
+    const uint4* resident[2]{};
+};
+struct RecurrentExpertCache {
+    uint4* data = nullptr;
+    int* tags = nullptr;
+    int slots = 0, stride = 0;
+};
+struct MappedCounts {
+    unsigned long long pairs = 0, hits = 0, bytes = 0;
+};
+void gather_experts(const MappedExpert* experts, const int* active, const int* count,
+                    const int* bounds, int capacity, int experts_count,
+                    uint4* stage, int up_words, int down_words, int up_stride, int down_stride,
+                    const void** tables, MappedCounts* counts, cudaStream_t stream);
+
+void gather_recurrent(const MappedExpert* experts, const int* active, const int* count,
+                      const int* bounds, int experts_count, int layer, RecurrentExpertCache cache,
+                      int* misses, int up, int down, int up_stride, int down_stride,
+                      const void** tables, MappedCounts* counts, cudaStream_t stream);
 
 // Rows in the GGUF vector kernels' q8_1 activation form (ggml_bridge.h's vector activation):
 // int8 values [T][k] and (d, sum) half2 pairs [T][k / 32].
@@ -184,6 +208,7 @@ struct KvArgs {
     __half* v_cache = nullptr;
     std::int64_t seq_stride = 0, head_stride = 0;
     int ring = 0;
+    bool packed_q4 = false; // full-attention rows in Q4_0; strides are still in two-byte units
 };
 void kv_post(const KvArgs& args, cudaStream_t stream);
 
@@ -214,10 +239,12 @@ struct AttentionArgs {
     const __half* v_cache = nullptr;
     std::int64_t seq_stride = 0, head_stride = 0;
     int ring = 0, window = 0;
+    bool packed_q4 = false;
     int query_heads = 0, kv_heads = 0;
     float scale = 1.0f;
     int splits  = 1;
     bool uniform = false;
+    bool shared_verify_cache = false;
     float* partial = nullptr; // decode: attention_workspace_floats
     const float* gate = nullptr;
     std::int64_t gate_stride = 0;
@@ -308,6 +335,10 @@ void route(const RouteArgs& args, cudaStream_t stream);
 void situ_rows(const float* gu, std::int64_t stride, int pairs, int width, const float* pair_scale,
                float gate_cap, float up_cap, __nv_bfloat16* out, cudaStream_t stream);
 
+void situ_rows_q8(const float* gu, int pairs, int width, const float* pair_scale,
+                  float gate_cap, float up_cap, Q8Rows out, cudaStream_t stream,
+                  const std::int32_t* active_ids = nullptr);
+
 // BF16 expert products: out[p][r] = sum_j W_e[r][j] x[p / x_div][j] in FP32 for every pair p of
 // an active expert e (the routing's grouping: pairs sorted[bounds[e], bounds[e + 1]), experts
 // active[0, *active_count), at most max_active of them), W_e the `rows` x `k` BF16 rows at
@@ -392,6 +423,7 @@ struct SparkRotateArgs {
     __half* v_cache = nullptr;
     std::int64_t seq_stride = 0, head_stride = 0;
     int ring = 0;
+    bool packed_q4 = false;
 };
 void spark_rotate(const SparkRotateArgs& args, cudaStream_t stream);
 

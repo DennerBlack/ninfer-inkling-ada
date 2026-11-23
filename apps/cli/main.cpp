@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "ninfer_build_id.h"
 #include "options.h"
 #include "product/logging/engine_diagnostics.h"
@@ -87,6 +89,8 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
         return "bf16";
     case ninfer::KvCacheStorage::Float16:
         return "fp16";
+    case ninfer::KvCacheStorage::InklingQ4_0:
+        return "q4_0";
     case ninfer::KvCacheStorage::Int8Group64:
         return "int8-group64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:

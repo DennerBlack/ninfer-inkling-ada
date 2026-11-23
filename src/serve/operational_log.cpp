@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "serve/operational_log.h"
 
 #include "product/log_colour/log_colour.h"
@@ -134,6 +136,8 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) noexcept {
         return "bf16";
     case ninfer::KvCacheStorage::Float16:
         return "fp16";
+    case ninfer::KvCacheStorage::InklingQ4_0:
+        return "q4_0";
     case ninfer::KvCacheStorage::Int8Group64:
         return "int8";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:

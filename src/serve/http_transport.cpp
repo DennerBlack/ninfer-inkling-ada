@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "serve/http_transport.h"
 
 #include "serve/request_validation.h"
@@ -149,6 +151,17 @@ NgramSessionHints resolve_ngram_session(const httplib::Request& request, const R
         hints.reset = true;
     }
     return ambiguous ? NgramSessionHints{} : hints;
+}
+
+ContextCacheHints conversation_cache(const httplib::Request& request) {
+    ContextCacheHints hints;
+    if (request.get_header_value_count("x-conversation-id") == 1) {
+        auto value = request.get_header_value("x-conversation-id");
+        if (!value.empty() && value.size() <= kMaximumContextCacheSessionKeyBytes) {
+            hints.session_key = std::move(value);
+        }
+    }
+    return hints;
 }
 
 bool client_disconnected(const httplib::Request& request) { return request.is_connection_closed(); }

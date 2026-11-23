@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #pragma once
 
 #include "core/expert_disk.h"
@@ -42,6 +44,7 @@ struct ExpertDeliveryLayer {
     // [expert][blob]. Aliases describe the projection-major device pointer table.
     std::vector<std::vector<ExpertBlob>> experts;
     std::vector<ExpertAlias> aliases;
+    std::uint32_t cache_weight = 1; // relative frequency of visits to this physical layer
 };
 class CpuSpinPool;
 
@@ -90,6 +93,10 @@ struct ExpertDeliveryOptions {
     // Persistent cache only; the layer banks are separate. Both explicit and automatic cache keep
     // keep_free_bytes free after physical allocation rounding.
     std::optional<std::uint64_t> cache_bytes;
+    // A host profile may specify a maximum while allowing fewer slots at initial allocation.
+    bool cache_bytes_are_limit = false;
+    // The display driver's process-local budget is meaningful inside the allocating process only.
+    std::optional<std::uint64_t> (*local_budget_remaining)(int device) = nullptr;
     std::uint64_t keep_free_bytes = 512ULL << 20;
     std::uint64_t staging_bytes = 128ULL << 20; // disk only, two pinned halves
     // Disk only: a drive mirror and the direct path (core/expert_disk.h).
@@ -102,6 +109,11 @@ struct ExpertDeliveryOptions {
     // wide call, each bank holds whole slots for the narrow calls' misses the tier does not admit,
     // and the next wide call takes its bank back.
     bool lend_banks = true;
+    bool overlap_cached_products = false;
+    bool recurrent_passes = false;
+    bool promote_lent_on_device = false;
+    bool eager_copy_event = false;
+    const char* route_trace_path = nullptr;
     bool suspendable = false; // existing VmmRegion allocations, fixed virtual addresses
     // The cache reserves addresses for every expert and backs only the slots it has, so its owner
     // can give slots back to memory that grows (shrink_cache) and take them again (grow_cache).
@@ -237,8 +249,11 @@ public:
     // (device ranges, ExpertCpuOptions::input_bytes in all) reach the CPU's products; a call
     // without them leaves nothing to the CPU (call.products and call.cpu stay null).
     [[nodiscard]] Call begin(std::size_t layer, const std::int32_t* ids, std::uint32_t pairs,
-                             cudaStream_t stream, std::span<const Input> inputs = {});
+                             cudaStream_t stream, std::span<const Input> inputs = {},
+                             const std::int32_t* sorted_bounds = nullptr);
     void await(cudaStream_t stream);
+    // After an eager await, before the next begin. Includes all the call's pairs.
+    [[nodiscard]] bool all_cached() const;
     // Projection-major [aliases][experts], including aliases into the same blob.
     [[nodiscard]] const void* const* tables(std::size_t layer) const;
     // Whether every entry of alias `alias` in tables(layer) is a multiple of `bytes` (a power of
@@ -249,6 +264,8 @@ public:
     void check() const;
     // Drain before suspend. Invalidate preserves allocations and graph addresses for restore.
     void drain();
+    // Stable until the next transport call. Caller has drained both streams.
+    const void* resident_blob(std::size_t layer, std::size_t expert, std::size_t blob) const;
     void invalidate();
     void release_device_backing(); // drain first, then release every transport device allocation
     void restore_device_backing(); // map at the same addresses and invalidate residency
@@ -275,6 +292,8 @@ public:
     std::uint64_t grow_cache();
     // The free device memory grow_cache leaves (ExpertDeliveryOptions::keep_free_bytes).
     void set_keep_free_bytes(std::uint64_t bytes);
+    // The compute stream must be idle before giving or reclaiming this workspace.
+    void lend_workspace(void* data, std::size_t bytes);
 
 private:
     struct Impl;

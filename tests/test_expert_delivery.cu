@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "core/device.h"
 #include "core/device_buffer.h"
 #include "core/expert_delivery.h"
@@ -468,6 +470,18 @@ int admission_boundaries(DeviceContext& device) {
             }
             mandatory_backing = delivery.state_backing_bytes();
         }
+        // A maximum is physical: one logical slot may take a full device granule.
+        options.cache_bytes = 256;
+        options.cache_bytes_are_limit = true;
+        {
+            ExpertDelivery delivery(device.rank(0), {}, {layer}, options);
+            const auto granule = suspendable ? vmm::granularity(device.device) : 1;
+            const auto allocated = delivery.memory();
+            if (allocated.cache_bytes > 256 || allocated.cache_slots != (granule <= 256 ? 1U : 0U)) {
+                throw std::runtime_error("initial expert cache exceeded its physical ceiling");
+            }
+        }
+        options.cache_bytes_are_limit = false;
         // With available room, report the physical size of a sub-granule slot, not its 256-byte
         // logical size.
         options.cache_bytes = 256;

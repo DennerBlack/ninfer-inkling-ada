@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "models/inkling2/executor.h"
 
 #include "core/decode_graph.h"
@@ -5,6 +7,7 @@
 #include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
+#include "core/mapped_host_copy.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -23,11 +26,21 @@
 
 #include <cuda_fp16.h>
 
+#ifdef _WIN32
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+#include <bit>
+#pragma comment(lib, "dxgi.lib")
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <charconv>
+#include <cstdlib>
+#include <cstdio>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -42,6 +55,28 @@ namespace ninfer::models::inkling2 {
 namespace {
 
 namespace gguf = ops::gguf;
+
+#ifdef _WIN32
+std::optional<std::uint64_t> local_budget_remaining(int device) {
+    cudaDeviceProp props{};
+    CUDA_CHECK(cudaGetDeviceProperties(&props, device));
+    if (!props.luidDeviceNodeMask) { return std::nullopt; }
+    LUID luid{};
+    static_assert(sizeof(luid) == sizeof(props.luid));
+    std::memcpy(&luid, props.luid, sizeof(luid));
+    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+    Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter;
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    const UINT node = std::countr_zero(props.luidDeviceNodeMask);
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf()))) ||
+        FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(adapter.GetAddressOf()))) ||
+        FAILED(adapter->QueryVideoMemoryInfo(node, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) ||
+        !info.Budget) { return std::nullopt; }
+    std::fprintf(stderr, "Inkling expert admission: WDDM local budget %llu MiB, current usage %llu MiB\n",
+                 info.Budget >> 20, info.CurrentUsage >> 20);
+    return info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
+}
+#endif
 
 constexpr std::size_t kAlign = 256;
 constexpr int kD             = 128; // head width
@@ -141,6 +176,9 @@ struct LayerPlan {
     gguf::GgmlType gate_up_type{}, down_type{};
     bool bf16 = false; // BF16 experts (both banks), multiplied by kernels::bf16_expert_rows
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
+    DeviceBuffer mapped_table;
+    std::vector<kernels::MappedExpert> mapped_sources;
+    std::array<int, 2> words{}, stride{};
     DeviceBuffer tables; // pointers: [E] gate, [E] up, [E] gate_up, [E] down
     bool gate_up_aligned16 = true, down_aligned16 = true;
     std::vector<DeviceBuffer> peer_tables; // expert parallelism: rank r's (r > 0)
@@ -153,14 +191,15 @@ struct LayerPlan {
 struct VisitPlan {
     std::uint32_t layer = 0, pass = 0;
     bool full = false;
+    bool packed_q4 = false;
     bool save_prelude = false; // the core's first visit of the first pass
     bool restart      = false; // the core's first visit of a later pass
     bool control      = false; // a later pass's core visit
     bool start        = false; // the layer starts a residual block
-    // The F16 K and V caches: [sequences][kv heads][slots][D].
+    // K and V caches: [sequences][kv heads][slots][position_bytes].
     KvArea k, v;
     int slots = 0, ring = 0;
-    std::int64_t seq_stride = 0, head_stride = 0;
+    std::int64_t seq_stride = 0, head_stride = 0; // in two-byte units for the kernels
     std::vector<DeviceBuffer> checkpoint; // sliding: every sequence's rings, K then V
 };
 
@@ -241,12 +280,22 @@ struct Executor::Impl {
     std::uint64_t kv_fixed = 0;
     std::vector<LayerPlan> layers;
     std::vector<VisitPlan> visits;
+    bool trace_visits = false;
+    unsigned trace_calls = 0;
+    std::vector<cudaEvent_t> visit_events;
+    void mark_visit(std::size_t index) {
+        if (trace_visits) { CUDA_CHECK(cudaEventRecord(visit_events.at(index), stream)); }
+    }
+
     // The convolutions' histories: [sequences][visits][kHistory][slot_floats], each slot K's,
     // V's, the attention output's and the MoE output's raw inputs; and their checkpoint.
     DeviceBuffer history, history_kept;
     std::uint64_t history_bytes = 0;
     std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
+    bool mapped_dirty = true;
+    DeviceBuffer mapped_counts;
+    kernels::MappedCounts published_mapped{};
 
     struct ExpertPeer {
         cudaStream_t stream = nullptr;
@@ -276,6 +325,33 @@ struct Executor::Impl {
     std::size_t workspace_bytes = 0;
     std::uint64_t kv_bytes      = 0;
     int decode_splits_full = 1, decode_splits_sliding = 1;
+    bool capture_target = true;
+    bool attention_graphs = false;
+    bool fused_experts = false;
+    bool joined_experts = false;
+    bool expert_graphs = false;
+    bool route_graphs = false;
+    bool sparse_stages = false;
+    bool reuse_route_bounds = false;
+    kernels::RecurrentExpertCache routed_cache{};
+    bool narrow_workspace = false;
+    std::size_t narrow_bytes = 0;
+    std::unique_ptr<WorkspaceArena> alternate_workspace;
+
+    void workspace_phase(bool decode) {
+        if (!alternate_workspace || decode == narrow_workspace) { return; }
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
+        auto* tail = static_cast<std::byte*>(workspace->base()) + narrow_bytes;
+        if (routed_cache.slots) {
+            if (decode) {
+                CUDA_CHECK(cudaMemsetAsync(routed_cache.tags, 0xff, sizeof(int) * routed_cache.slots, stream));
+            }
+        } else {
+            delivery->lend_workspace(decode ? tail : nullptr, decode ? workspace_bytes - narrow_bytes : 0);
+        }
+        workspace.swap(alternate_workspace);
+        narrow_workspace = decode;
+    }
     std::map<std::uint32_t, GraphEntry> graphs;
     std::vector<std::uint32_t> verify_widths;
     std::unique_ptr<dspine::Runtime> spine;
@@ -358,8 +434,9 @@ struct Executor::Impl {
         {
             std::size_t needed = 0;
             for (const auto& [layer, pass] : schedule) {
-                const std::size_t kv = 2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
-                needed += config.full_attention[layer]
+                const bool full = config.full_attention[layer];
+                const std::size_t kv = 2 * std::size_t(kv_heads) * kv_row_bytes(full) * sequences;
+                needed += full
                               ? std::size_t(global_slots) * kv
                               : (options.checkpoints ? 2 : 1) * std::size_t(ring) * kv;
             }
@@ -398,23 +475,7 @@ struct Executor::Impl {
             p.restart      = config.core(layer) && layer == config.core_start && pass > 0;
             p.control      = config.core(layer) && pass > 0;
             p.start        = layer % config.block_size == 0;
-            p.slots        = p.full ? global_slots : ring;
-            p.ring         = p.full ? 0 : ring;
-            p.head_stride  = std::int64_t(p.slots) * kD;
-            p.seq_stride   = p.head_stride * kv_heads;
-            const bool grows = growing && p.full;
-            for (KvArea* area : {&p.k, &p.v}) {
-                *area = KvArea(std::size_t(sequences), kv_heads,
-                               std::size_t(p.head_stride) * sizeof(__half), row_f16, grows,
-                               device_id);
-                kv_bytes += area->bytes;
-            }
-            if (!p.full && options.checkpoints) {
-                for (int c = 0; c < 2; ++c) {
-                    p.checkpoint.emplace_back(std::size_t(p.seq_stride) * sizeof(__half) * sequences);
-                    kv_bytes += p.checkpoint.back().bytes;
-                }
-            }
+            allocate_kv(p, sequences, device_id);
             visits.push_back(std::move(p));
         }
         {
@@ -463,7 +524,50 @@ struct Executor::Impl {
         }
         kv_backed       = kv_fixed;
         if (options.vision_max_patches > 0) { plan_vision(); }
-        workspace_bytes = plan_workspace();
+        workspace_bytes = plan_workspace(options.prefill_chunk);
+        if (options.mapped_misses) {
+            if (bf16_rows || growing || model.expert_banks().size() != layers.size()) {
+                throw std::invalid_argument("Inkling 2 mapped decode requires fixed quantized host experts");
+            }
+            std::size_t largest = 0;
+            for (auto& p : layers) {
+                const auto index = std::size_t(p.delivery_layer);
+                if (index >= model.expert_banks().size()) {
+                    throw std::invalid_argument("missing expert bank for mapped decode");
+                }
+                const auto& experts = model.expert_banks()[index].delivery.experts;
+                p.mapped_sources.resize(experts.size());
+                p.mapped_table = DeviceBuffer(experts.size() * sizeof(kernels::MappedExpert));
+                std::array<const std::byte*, 2> mapped_base{};
+                for (std::size_t e = 0; e < experts.size(); ++e) {
+                    for (int b = 0; b < 2; ++b) {
+                        const auto& blob = experts[e].at(b);
+                        auto& first = experts.front().at(b);
+                        if (!blob.pinned || blob.bytes % sizeof(uint4) || blob.bytes != first.bytes ||
+                            blob.pinned_region != first.pinned_region ||
+                            std::uintptr_t(blob.pinned) % alignof(uint4)) {
+                            throw std::invalid_argument("Inkling 2 mapped decode needs aligned equal expert rows");
+                        }
+                        if (!mapped_base[b]) {
+                            void* ptr = nullptr;
+                            CUDA_CHECK(cudaHostGetDevicePointer(&ptr, reinterpret_cast<void*>(blob.pinned_region), 0));
+                            mapped_base[b] = static_cast<const std::byte*>(ptr);
+                        }
+                        const auto offset = std::uintptr_t(blob.pinned) - blob.pinned_region;
+                        p.mapped_sources[e].host[b] = reinterpret_cast<const uint4*>(mapped_base[b] + offset);
+                        p.words[b]  = int(blob.bytes / sizeof(uint4));
+                        p.stride[b] = int(round_up(blob.bytes + blob.zero_tail, kAlign) / sizeof(uint4));
+                    }
+                }
+                largest = std::max(largest, sizeof(uint4) * std::size_t(p.stride[0] + p.stride[1]));
+            }
+            const auto rows = gguf::kMaxVectorColumns;
+            const auto active = std::min<std::size_t>(config.num_experts, rows * config.top_k_experts);
+            workspace_bytes = std::max(workspace_bytes, plan_workspace(rows) + largest * active +
+                                      round_up(2 * config.num_experts * sizeof(void*), kAlign));
+            mapped_counts = DeviceBuffer(sizeof(kernels::MappedCounts));
+            mapped_counts.fill();
+        }
         if (tower) { workspace_bytes = std::max(workspace_bytes, tower->workspace_bytes()); }
         {
             std::size_t free_bytes = 0, total_bytes = 0;
@@ -482,6 +586,50 @@ struct Executor::Impl {
         if (options.dspine) { make_spine(); }
         allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
+        // On WDDM and WSL2 a graph's queued copies can block the expert service's DMA that the
+        // replay is waiting for. The DSpark graph has no expert delivery and remains safe.
+        capture_target = options.cuda_graphs && (options.mapped_misses || !(delivery && serialized_copy_queue()));
+        const char* segmented = std::getenv("HEL_INKLING_ATTENTION_GRAPHS");
+        attention_graphs = segmented && std::string_view(segmented) == "1" && delivery &&
+                           options.cuda_graphs && !capture_target && !bf16_rows && !growing;
+        const auto flag = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value && std::string_view(value) == "1";
+        };
+        fused_experts = flag("HEL_INKLING_FUSED_EXPERTS");
+        joined_experts = flag("HEL_INKLING_JOINED_EXPERTS");
+        expert_graphs = attention_graphs && flag("HEL_INKLING_EXPERT_GRAPHS");
+        route_graphs = expert_graphs && flag("HEL_INKLING_ROUTE_GRAPHS");
+        sparse_stages = expert_graphs && fused_experts && flag("HEL_INKLING_SPARSE_STAGES");
+        reuse_route_bounds = flag("HEL_INKLING_REUSE_ROUTE_BOUNDS");
+        if (delivery && !model.expert_parallel() && !options.mapped_misses && !growing &&
+            !capture_target && flag("HEL_INKLING_LEND_WORKSPACE")) {
+            narrow_bytes = round_up(plan_workspace(gguf::kMaxVectorColumns), kAlign);
+            if (workspace_bytes > narrow_bytes + (16u << 20)) {
+                alternate_workspace = std::make_unique<WorkspaceArena>(DeviceSpan{workspace->base(), narrow_bytes});
+                std::fprintf(stderr, "Inkling 2: %zu MiB prefill workspace available to decode experts\n",
+                             (workspace_bytes - narrow_bytes) >> 20);
+            }
+        }
+        if (options.mapped_misses && flag("HEL_INKLING_RECURRENT_CACHE")) {
+            narrow_bytes = round_up(plan_workspace(gguf::kMaxVectorColumns), kAlign);
+            int stride = 0;
+            for (const auto& layer : layers) { stride = std::max(stride, layer.stride[0] + layer.stride[1]); }
+            const auto slot_bytes = sizeof(uint4) * std::size_t(stride);
+            const auto available = workspace_bytes > narrow_bytes ? workspace_bytes - narrow_bytes : 0;
+            const auto slots = available > kAlign ? (available - kAlign) / (sizeof(int) + slot_bytes) : 0;
+            if (slots >= config.num_experts && config.num_experts <= 256) {
+                auto* tail = static_cast<std::byte*>(workspace->base()) + narrow_bytes;
+                routed_cache.slots = int(slots);
+                routed_cache.stride = stride;
+                routed_cache.tags = reinterpret_cast<int*>(tail);
+                routed_cache.data = reinterpret_cast<uint4*>(tail + round_up(slots * sizeof(int), kAlign));
+                alternate_workspace = std::make_unique<WorkspaceArena>(DeviceSpan{workspace->base(), narrow_bytes});
+                std::fprintf(stderr, "Inkling 2: %d recurrent GPU expert slots in prefill workspace\n", int(slots));
+            }
+        }
+        if (attention_graphs) { std::fprintf(stderr, "Inkling 2: attention-only CUDA graphs enabled\n"); }
+
     }
 
     LayerPlan plan_layer(std::uint32_t i) {
@@ -536,7 +684,7 @@ struct Executor::Impl {
         p.moe_conv    = fp32(model, mw.output_conv, hidden * kTaps);
         if (mw.gate_up_scale) { p.gate_up_scale = fp32(model, *mw.gate_up_scale, e); }
         if (mw.down_scale) { p.down_scale = fp32(model, *mw.down_scale, e); }
-        if (model.expert_residency() == ExpertResidency::Device) {
+        if (mw.gate_up || model.expert_parallel()) {
             const auto bank_tables = [&](WeightId gate_up_id, WeightId down_id, std::uint32_t first,
                                          std::uint32_t last) {
                 const Weight gate_up = matrix(model, {gate_up_id});
@@ -593,8 +741,11 @@ struct Executor::Impl {
                 }
             }
         } else {
-            p.delivery_layer    = int(i);
-            const auto& bank    = model.expert_banks()[i];
+            const auto banks = model.expert_banks();
+            const auto found = std::find_if(banks.begin(), banks.end(), [i](const auto& bank) { return bank.layer_index == i; });
+            if (found == banks.end()) { throw std::logic_error("Missing Inkling expert delivery bank"); }
+            p.delivery_layer = static_cast<int>(found - banks.begin());
+            const auto& bank = *found;
             p.bf16 = bank.gate_up_type == QType::BF16 && bank.down_type == QType::BF16;
             if (!p.bf16) {
                 p.gate_up_type = ops::detail::gguf_type(bank.gate_up_type);
@@ -750,14 +901,37 @@ struct Executor::Impl {
 
     struct Call;
 
+    [[nodiscard]] std::size_t kv_row_bytes(bool full) const {
+        constexpr auto block = gguf_block_shape(QType::GGUF_Q4_0);
+        return full && options.packed_q4 ? kD / block.elements * block.bytes : kD * sizeof(__half);
+    }
+
+    void allocate_kv(VisitPlan& plan, int sequences, int device_id) {
+        const std::size_t row_bytes = kv_row_bytes(plan.full);
+        plan.packed_q4 = plan.full && options.packed_q4;
+        plan.slots = plan.full ? global_slots : ring;
+        plan.ring = plan.full ? 0 : ring;
+        plan.head_stride = std::int64_t(plan.slots) * row_bytes / sizeof(__half);
+        plan.seq_stride = plan.head_stride * kv_heads;
+        for (KvArea* area : {&plan.k, &plan.v}) {
+            *area = KvArea(std::size_t(sequences), kv_heads, plan.slots * row_bytes, row_bytes,
+                           growing && plan.full, device_id);
+            kv_bytes += area->bytes;
+            if (!plan.full && options.checkpoints) {
+                plan.checkpoint.emplace_back(area->bytes);
+                kv_bytes += area->bytes;
+            }
+        }
+    }
+
     // A drafter layer's caches: a sliding layer's ring (the window and kR slots past it, like the
     // target's) with its checkpoint, a full layer's every position.
     [[nodiscard]] std::size_t spark_planned_bytes() const {
         const DSparkConfig& dc = *model.dspark_config();
-        const std::size_t kv = 2 * std::size_t(dc.num_key_value_heads) * dc.head_dim * sizeof(__half) *
-                               options.sequences;
         std::size_t bytes = 0;
         for (const bool full : dc.full_attention) {
+            const std::size_t kv = 2 * std::size_t(dc.num_key_value_heads) *
+                                   kv_row_bytes(full) * options.sequences;
             bytes += full ? std::size_t(round_up(options.max_context + 1, 256)) * kv
                           : (options.checkpoints ? 2 : 1) * std::size_t(ring) * kv;
         }
@@ -810,7 +984,6 @@ struct Executor::Impl {
             d->markov_embed = static_cast<const __nv_bfloat16*>(t.data);
         }
         const int q = query_heads * kD, w = int(dc.intermediate_size);
-        const std::size_t row_f16 = std::size_t(kD) * sizeof(__half);
         for (std::uint32_t i = 0; i < dc.num_hidden_layers; ++i) {
             const DSparkLayerWeights& lw = dw.layers[i];
             SparkLayer l;
@@ -834,22 +1007,7 @@ struct Executor::Impl {
             l.context_key_norm = fp32(model, lw.context_key_norm, kD);
             VisitPlan& c   = l.cache;
             c.full         = dc.full_attention[i];
-            c.slots        = c.full ? global_slots : ring;
-            c.ring         = c.full ? 0 : ring;
-            c.head_stride  = std::int64_t(c.slots) * kD;
-            c.seq_stride   = c.head_stride * kv_heads;
-            for (KvArea* area : {&c.k, &c.v}) {
-                *area = KvArea(std::size_t(sequences), kv_heads,
-                               std::size_t(c.head_stride) * sizeof(__half), row_f16,
-                               growing && c.full, device_id);
-                kv_bytes += area->bytes;
-            }
-            if (!c.full && options.checkpoints) {
-                for (int k = 0; k < 2; ++k) {
-                    c.checkpoint.emplace_back(std::size_t(c.seq_stride) * sizeof(__half) * sequences);
-                    kv_bytes += c.checkpoint.back().bytes;
-                }
-            }
+            allocate_kv(c, sequences, device_id);
             d->layers.push_back(std::move(l));
         }
         const std::size_t contexts = std::size_t(sequences) * kR * hidden * 4;
@@ -971,6 +1129,7 @@ struct Executor::Impl {
             ra.seq_stride  = layer.cache.seq_stride;
             ra.head_stride = layer.cache.head_stride;
             ra.ring        = layer.cache.ring;
+            ra.packed_q4   = layer.cache.packed_q4;
             kernels::spark_rotate(ra, stream);
         }
     }
@@ -1033,6 +1192,7 @@ struct Executor::Impl {
             ra.seq_stride  = l.cache.seq_stride;
             ra.head_stride = l.cache.head_stride;
             ra.ring        = l.cache.ring;
+            ra.packed_q4   = l.cache.packed_q4;
             kernels::spark_rotate(ra, stream);
             kernels::AttentionArgs aa;
             aa.rows        = rows;
@@ -1042,6 +1202,7 @@ struct Executor::Impl {
             aa.seq_stride  = l.cache.seq_stride;
             aa.head_stride = l.cache.head_stride;
             aa.ring        = l.cache.ring;
+            aa.packed_q4   = l.cache.packed_q4;
             aa.window      = l.cache.full ? 0 : d.window + b;
             aa.query_heads = query_heads;
             aa.kv_heads    = kv_heads;
@@ -1143,13 +1304,33 @@ struct Executor::Impl {
         std::memcpy(confidence.data(), host + std::size_t(b) * 4, std::size_t(k) * 4);
     }
 
+    void refresh_mapped_experts() {
+        if (!options.mapped_misses || !mapped_dirty) { return; }
+        delivery->drain();
+        for (auto& p : layers) {
+            for (std::size_t e = 0; e < p.mapped_sources.size(); ++e) {
+                for (int b = 0; b < 2; ++b) {
+                    p.mapped_sources[e].resident[b] = static_cast<const uint4*>(
+                        delivery->resident_blob(p.delivery_layer, e, b));
+                }
+            }
+            p.mapped_table.copy_from_host(p.mapped_sources.data(), p.mapped_table.bytes);
+        }
+        mapped_dirty = false;
+    }
+
     // ---- Expert delivery -------------------------------------------------------------------------
 
     void plan_delivery() {
         std::vector<ExpertDeliveryLayer> sources;
         std::vector<std::uint64_t> sizes;
+        const char* bias = std::getenv("HEL_INKLING_CORE_CACHE");
+        const unsigned core_weight = bias && std::string_view(bias) == "passes" ? config.num_passes :
+                                     bias && std::string_view(bias) == "prefer" ? config.num_experts : 1u;
         for (const auto& bank : model.expert_banks()) {
+            const auto layer = bank.layer_index;
             sources.push_back(bank.delivery);
+            if (config.core(layer)) { sources.back().cache_weight = core_weight; }
             for (const auto& expert : bank.delivery.experts) {
                 sizes.resize(std::max(sizes.size(), expert.size()), 0);
                 for (std::size_t b = 0; b < expert.size(); ++b) {
@@ -1167,7 +1348,9 @@ struct Executor::Impl {
                               config.num_experts * 4;
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        const auto cache = options.expert_cache_bytes.value_or(0);
+        const char* cap = std::getenv("HEL_INKLING_EXPERT_CACHE_CEILING");
+        const bool cache_is_limit = cap && std::string_view(cap) == "1";
+        const auto cache = cache_is_limit ? 0 : options.expert_cache_bytes.value_or(0);
         if (bank + metadata + cache + unbacked() + kGraphReserve > free) {
             throw InsufficientMemory("Inkling 2: expert delivery needs " +
                 std::to_string((bank + metadata + cache) >> 20) + " MiB beside " +
@@ -1175,9 +1358,33 @@ struct Executor::Impl {
                 " MiB for the growing caches and the CUDA Graph reserve after workspace allocation");
         }
         ExpertDeliveryOptions transport;
+        const char* overlap = std::getenv("HEL_INKLING_OVERLAP_EXPERTS");
+        transport.overlap_cached_products = overlap && std::string_view(overlap) == "1";
+        // The loop revisits its first core layer twice within the same verify round.
+        const char* epoch = std::getenv("HEL_INKLING_TIER_PER_TOKEN");
+        transport.recurrent_passes = epoch && std::string_view(epoch) == "1";
+        const char* local = std::getenv("HEL_INKLING_PROMOTE_LOCAL");
+        transport.promote_lent_on_device = local && std::string_view(local) == "1";
+        const char* dma_event = std::getenv("HEL_INKLING_COPY_EVENT");
+        transport.eager_copy_event = dma_event && std::string_view(dma_event) == "1";
+        transport.route_trace_path = std::getenv("HEL_INKLING_ROUTE_TRACE");
         transport.pair_capacity   = options.prefill_chunk * config.top_k_experts;
         transport.cache_bytes     = options.expert_cache_bytes;
-        transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
+        transport.cache_bytes_are_limit = cache_is_limit;
+#ifdef _WIN32
+        if (cache_is_limit) { transport.local_budget_remaining = local_budget_remaining; }
+#endif
+        std::size_t admission_reserve = 0;
+        if (const char* value = std::getenv("HEL_INKLING_ALLOCATION_RESERVE_MIB")) {
+            const std::string_view text(value);
+            unsigned mib = 0;
+            const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), mib);
+            if (error != std::errc{} || end != text.data() + text.size() || mib > 8192) {
+                throw std::invalid_argument("Invalid Inkling initial GPU reserve");
+            }
+            admission_reserve = std::size_t(mib) << 20;
+        }
+        transport.keep_free_bytes = kGraphReserve + admission_reserve + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
         transport.disk            = options.expert_disk;
         const float dma_share     = options.expert_dma_share.value_or(0.0F);
@@ -1196,9 +1403,9 @@ struct Executor::Impl {
             computes = computes || CpuExperts::computes(cpu_layers.back(), hidden,
                                                         int(config.moe_intermediate_size));
             std::vector<float> s;
-            if (layers[l].gate_up_scale != nullptr) {
+            if (layers[bank.layer_index].gate_up_scale != nullptr) {
                 s.resize(config.num_experts);
-                CUDA_CHECK(cudaMemcpy(s.data(), layers[l].gate_up_scale, s.size() * 4,
+                CUDA_CHECK(cudaMemcpy(s.data(), layers[bank.layer_index].gate_up_scale, s.size() * 4,
                                       cudaMemcpyDeviceToHost));
             }
             scales.push_back(std::move(s));
@@ -1336,6 +1543,7 @@ struct Executor::Impl {
 
     ~Impl() {
         if (delivery || growing) { ninfer::wait_for_stream(stream); }
+        for (auto event : visit_events) { if (event) { cudaEventDestroy(event); } }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
@@ -1362,8 +1570,7 @@ struct Executor::Impl {
         return round_up(gguf::vector_activation_bytes(k, t), kAlign);
     }
 
-    std::size_t plan_workspace() const {
-        const std::size_t t = options.prefill_chunk;
+    std::size_t plan_workspace(std::size_t t) const {
         const std::size_t h = hidden;
         const std::size_t q_floats = std::size_t(query_heads) * kD;
         const std::size_t width    = config.moe_intermediate_size;
@@ -1409,7 +1616,8 @@ struct Executor::Impl {
         if (options.dspark) {             // the drafter's stored taps
             add((model.dspark_config()->target_visits.size() - 1) * t * h * 4);
         }
-        // Visit scope.
+        const std::size_t call_bytes = bytes;
+        // Attention and routed experts use successive scopes on the execution stream.
         add(t * query_rows * 4);          // [Q; gate; relative]
         add(t * 2 * kvd * 4);             // raw K, V
         add(t * 2 * kvd * 4 / kD * kTaps); // dynamic taps
@@ -1418,10 +1626,13 @@ struct Executor::Impl {
         add(t * query_heads * 16 * 4);    // r
         add(t * q_floats * 2);            // attention out BF16
         add(t * h * 4);                   // output product
+        const std::size_t attention_bytes = bytes - call_bytes;
+        bytes = call_bytes;
         // Controllers of three inputs: [rms x; rms m], the rank's hidden state, forget and gain.
         add(3 * t * 2 * h * 4);
         add(3 * t * rank * 4);
         add(2 * 3 * t * h * 4);
+        const auto controller_bytes = bytes - call_bytes;
         add(std::size_t(kHeadRows) * head_tiles.n * 4); // head FP32 plane
         add(kHeadRows * h * 2);
         std::size_t moe = 0;
@@ -1430,11 +1641,17 @@ struct Executor::Impl {
             moe += round_up(pairs * 4, kAlign) * 3;                   // ids, weights, pair scales
             moe += round_up(t * config.num_experts * 4, kAlign);      // logits
             moe += round_up(gguf::moe_routing_bytes(int(config.num_experts), int(pairs)), kAlign);
-            moe += round_up(gguf::moe_matrix_activation_bytes(int(h), int(pairs)), kAlign);
-            moe += round_up(pairs * 2 * width * 4, kAlign);
+            const auto up_input = round_up(gguf::moe_matrix_activation_bytes(int(h), int(pairs)), kAlign);
+            const auto down_input = round_up(gguf::moe_matrix_activation_bytes(int(width), int(pairs)), kAlign);
+            const auto up_result = round_up(pairs * 2 * width * 4, kAlign);
+            const auto down_result = round_up(pairs * h * 4, kAlign);
+            if (model.expert_parallel() || std::any_of(layers.begin(), layers.end(),
+                                                      [](const LayerPlan& p) { return p.bf16; })) {
+                moe += up_input + down_input + up_result + down_result;
+            } else {
+                moe += std::max(up_input, down_input) + std::max(up_result, down_result);
+            }
             moe += round_up(pairs * width * 2, kAlign);
-            moe += round_up(gguf::moe_matrix_activation_bytes(int(width), int(pairs)), kAlign);
-            moe += round_up(pairs * h * 4, kAlign);
             if (model.expert_parallel()) {
                 moe += round_up(pairs * 4, kAlign) +
                        round_up(gguf::moe_routing_bytes(int(config.num_experts), int(pairs)), kAlign) +
@@ -1443,7 +1660,19 @@ struct Executor::Impl {
         }
         const std::size_t decode = kernels::attention_workspace_floats(
             decode_rows(), query_heads, std::max(decode_splits_full, decode_splits_sliding)) * 4;
-        return bytes + moe + round_up(decode, kAlign) + gguf_scratch + (16u << 20);
+        if (options.dspark && !model.expert_parallel() && !bf16_rows) {
+            const auto head_bytes = bytes - call_bytes - controller_bytes;
+            const auto inject_bytes = round_up(model.dspark_config()->num_hidden_layers * t * h * 2, kAlign) +
+                                      round_up(t * 2 * kvd * 4, kAlign);
+            // All temporaries below are released before the next phase on the same stream.
+            // The attention result y lives across its controller and projections.
+            const auto phase_peak = std::max({controller_bytes + round_up(t * h * 4, kAlign),
+                head_bytes + gguf_scratch, inject_bytes + gguf_scratch, moe,
+                attention_bytes + gguf_scratch + round_up(decode, kAlign)});
+            return call_bytes + phase_peak +
+                   round_up(kernels::mix_split_floats(int(t), hidden) * 4, kAlign) + (16u << 20);
+        }
+        return bytes + std::max(moe, attention_bytes) + round_up(decode, kAlign) + gguf_scratch + (16u << 20);
     }
 
     // ---- Expert parallelism ----------------------------------------------------------------------
@@ -2010,6 +2239,7 @@ struct Executor::Impl {
         }
         CUDA_CHECK(cudaMemcpyAsync(d_patches.p, patches.data(), patches.size() * 2,
                                    cudaMemcpyHostToDevice, stream));
+        workspace_phase(false);
         workspace->reset();
         tower->encode(static_cast<const __nv_bfloat16*>(d_patches.p), grid_w, grid_h,
                       static_cast<__nv_bfloat16*>(d_image_rows.p), *workspace, stream);
@@ -2049,23 +2279,12 @@ struct Executor::Impl {
         return h;
     }
 
-    void visit(Call& c, std::size_t v) {
+    void attention_product(Call& c, std::size_t v, bool prepare_inputs, float* y) {
         const VisitPlan& vp = visits[v];
         const LayerPlan& lp = layers[vp.layer];
-        States& s           = c.states;
-        const int t         = c.t;
-        auto scope          = workspace->scope();
-        if (vp.save_prelude) {
-            s.prelude_blocks = s.blocks;
-            s.prelude_cur    = s.cur;
-        } else if (vp.restart) {
-            s.bank.assign(s.blocks.begin() + std::ptrdiff_t(s.prelude_blocks.size() + 1),
-                          s.blocks.end());
-            s.bank_last     = s.cur;
-            s.blocks        = s.prelude_blocks;
-            s.cur           = s.prelude_cur;
-            c.inputs_ready  = false;
-        }
+        States& s = c.states;
+        const int t = c.t;
+        auto scope = workspace->scope();
         if (vp.control) {
             // The messages of the previous pass's states, one per input.
             kernels::MixArgs m;
@@ -2083,7 +2302,7 @@ struct Executor::Impl {
             kernels::mix(m, stream);
         }
         // The attention's inputs.
-        if (!c.inputs_ready) {
+        if (prepare_inputs) {
             if (vp.layer == 0) {
                 kernels::rms_norm(s.buffers[s.cur], lp.input_norm, hidden, t, eps, c.in_bf16,
                                   stream, c.q8 ? c.in_q.rows : kernels::Q8Rows{}, c.in_f32);
@@ -2091,7 +2310,6 @@ struct Executor::Impl {
                 kernels::mix(attention_mix(c, v), stream);
             }
         }
-        c.inputs_ready = false;
         if (vp.control) {
             const float* x0 = c.raw;
             const float* x1 = lp.full ? c.raw + c.plane : c.raw;
@@ -2102,9 +2320,6 @@ struct Executor::Impl {
             control(c, lp, 3, {x0, x1, x2},
                     {c.messages, c.messages + c.plane, c.messages + 2 * c.plane}, {0, 1, 2}, norms,
                     c.in_bf16, c.in_q, c.in_q_stride, c.in_f32);
-            c.distinct = 3;
-        } else {
-            c.distinct = lp.full ? 3 : 1;
         }
         const int ki = c.distinct == 3 ? 1 : 0, vi = c.distinct == 3 ? 2 : 0;
         const auto bf16_in = [&](int i) {
@@ -2199,6 +2414,7 @@ struct Executor::Impl {
             ka.seq_stride  = vp.seq_stride;
             ka.head_stride = vp.head_stride;
             ka.ring        = vp.ring;
+            ka.packed_q4   = vp.packed_q4;
         }
         kernels::kv_post(ka, stream);
         if (c.chunk) {
@@ -2228,6 +2444,8 @@ struct Executor::Impl {
             aa.seq_stride  = ka.seq_stride;
             aa.head_stride = ka.head_stride;
             aa.ring        = ka.ring;
+            aa.packed_q4   = ka.packed_q4;
+            aa.shared_verify_cache = options.sequences == 1 && !c.chunk && t >= 2 && lp.full;
             aa.window      = lp.full ? 0 : window;
             aa.query_heads = query_heads;
             aa.kv_heads    = kv_heads;
@@ -2255,8 +2473,36 @@ struct Executor::Impl {
             back.end   = c.first + c.kept;
             kernels::ring_copy(back, stream);
         }
-        auto* y = static_cast<float*>(workspace->alloc_bytes(std::size_t(c.plane) * 4).data);
         product(lp.output, c.q8 ? attn_q.base : nullptr, attn, t, y, hidden);
+    }
+
+    void visit_attention(Call& c, std::size_t v) {
+        const VisitPlan& vp = visits[v];
+        const LayerPlan& lp = layers[vp.layer];
+        States& s           = c.states;
+        const int t         = c.t;
+        auto scope          = workspace->scope();
+        if (vp.save_prelude) {
+            s.prelude_blocks = s.blocks;
+            s.prelude_cur    = s.cur;
+        } else if (vp.restart) {
+            s.bank.assign(s.blocks.begin() + std::ptrdiff_t(s.prelude_blocks.size() + 1),
+                          s.blocks.end());
+            s.bank_last     = s.cur;
+            s.blocks        = s.prelude_blocks;
+            s.cur           = s.prelude_cur;
+            c.inputs_ready  = false;
+        }
+        const bool prepare_inputs = !c.inputs_ready;
+        c.inputs_ready = false;
+        c.distinct = vp.control || lp.full ? 3 : 1;
+        auto* y = static_cast<float*>(workspace->alloc_bytes(std::size_t(c.plane) * 4).data);
+        if (attention_graphs && !c.chunk) {
+            const auto key = 65536u + std::uint32_t((t - 1) * visits.size() + v);
+            run_graph(key, [&] { attention_product(c, v, prepare_inputs, y); });
+        } else {
+            attention_product(c, v, prepare_inputs, y);
+        }
         // The attention's residual update, then the MoE input's mix.
         if (vp.start) {
             s.blocks.push_back(s.cur);
@@ -2279,10 +2525,26 @@ struct Executor::Impl {
                 kernels::keep_products(ra, begin, end, stream);
             }
         }
-        if (vp.control) {
-            control(c, lp, 1, {c.ffn_raw, nullptr, nullptr}, {c.messages + 3 * c.plane, nullptr, nullptr},
-                    {3, 0, 0}, {lp.ffn_norm, nullptr, nullptr}, c.ffn_bf16, c.ffn_q, 0, c.ffn_f32);
+    }
+
+    void ffn_control(Call& c, std::size_t v) {
+        if (visits[v].control) {
+            const auto& lp = layers[visits[v].layer];
+            control(c, lp, 1, {c.ffn_raw, nullptr, nullptr},
+                    {c.messages + 3 * c.plane, nullptr, nullptr}, {3, 0, 0},
+                    {lp.ffn_norm, nullptr, nullptr}, c.ffn_bf16, c.ffn_q, 0, c.ffn_f32);
         }
+    }
+
+    void visit(Call& c, std::size_t v) {
+        mark_visit(2*v);
+        visit_attention(c, v);
+        mark_visit(2*v+1);
+        const VisitPlan& vp = visits[v];
+        const LayerPlan& lp = layers[vp.layer];
+        States& s = c.states;
+        auto scope = workspace->scope();
+        if (!route_graphs || c.chunk) { ffn_control(c, v); }
         // The routed experts, then their residual update and the next visit's mix (or the
         // output's after the last visit).
         kernels::ResidualArgs ra;
@@ -2293,7 +2555,7 @@ struct Executor::Impl {
         ra.cur     = s.buffers[s.cur];
         ra.hidden  = hidden;
         ra.mix.split = c.split;
-        experts(lp, c, ra);
+        experts(lp, c, ra, v);
         const bool last = v + 1 == visits.size();
         if (last) {
             ra.mix = output_mix_args(c);
@@ -2310,7 +2572,7 @@ struct Executor::Impl {
 
     // The routed experts of layer `p` for the call's MoE input; their product lands where the
     // residual update `ra` reads it.
-    void experts(const LayerPlan& p, Call& c, kernels::ResidualArgs& ra) {
+    void experts(const LayerPlan& p, Call& c, kernels::ResidualArgs& ra, std::size_t visit_id) {
         const int t = c.t;
         const int e = int(config.num_experts), k = int(config.top_k_experts);
         const int width = int(config.moe_intermediate_size);
@@ -2319,7 +2581,6 @@ struct Executor::Impl {
         auto* weights    = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * 4).data);
         auto* pair_scale = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * 4).data);
         auto* logits     = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * e * 4).data);
-        kernels::gemm_f32(e, t, hidden, p.router, c.ffn_f32, logits, stream);
         kernels::RouteArgs route;
         route.hidden        = hidden;
         route.tokens        = t;
@@ -2347,7 +2608,15 @@ struct Executor::Impl {
                                               const_cast<std::int32_t*>(routing.tiles),
                                               routing.tile_capacity};
         }
-        kernels::route(route, stream);
+        // One launch from the recurrent FFN controller to sorted expert IDs. The host
+        // sees the same route tensor when it schedules the selected experts.
+        const bool replay_route = route_graphs && !c.chunk;
+        const auto route_key = 262144u + std::uint32_t((t - 1) * visits.size() + visit_id);
+        run_graph(route_key, [&] {
+            if (replay_route) { ffn_control(c, visit_id); }
+            kernels::gemm_f32(e, t, hidden, p.router, c.ffn_f32, logits, stream);
+            kernels::route(route, stream);
+        }, replay_route);
         const bool vector = c.q8;
         const void* act   = vector ? c.ffn_q.base : nullptr;
         if (model.expert_parallel()) {
@@ -2357,25 +2626,50 @@ struct Executor::Impl {
         if (!sorted) { routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream); }
         const bool cpu = cpu_experts && t <= CpuExperts::kMaxTokens && vector;
         std::optional<ExpertDelivery::Call> call;
-        if (delivery) {
+        const bool mapped = options.mapped_misses && vector && !c.chunk;
+        if (p.delivery_layer >= 0 && !mapped) {
+            mapped_dirty = true;
             const std::array<ExpertDelivery::Input, 2> inputs{
                 ExpertDelivery::Input{act, cpu ? cpu_experts->activation_bytes(t) : 0},
                 ExpertDelivery::Input{weights, cpu ? cpu_experts->weight_bytes(t) : 0}};
             call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream,
                                    cpu ? std::span<const ExpertDelivery::Input>(inputs)
-                                       : std::span<const ExpertDelivery::Input>());
+                                       : std::span<const ExpertDelivery::Input>(),
+                                   sorted && reuse_route_bounds && !c.chunk ? routing.bounds : nullptr);
         }
-        const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
+        const auto* tables = p.delivery_layer >= 0 ? delivery->tables(std::size_t(p.delivery_layer))
                                       : static_cast<const void* const*>(p.tables.p);
-        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden,
-                                     p.gate_up_aligned16};
-        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width,
-                                  p.down_aligned16};
         const int max_active = std::min(pairs, e);
+        const void* const* up_table = tables + 2 * e;
+        const void* const* down_table = tables + 3 * e;
+        if (mapped) {
+            auto* selected = static_cast<const void**>(workspace->alloc_bytes(2 * e * sizeof(void*)).data);
+            const auto* sources = static_cast<const kernels::MappedExpert*>(p.mapped_table.p);
+            auto* counts = static_cast<kernels::MappedCounts*>(mapped_counts.p);
+            if (routed_cache.slots) {
+                auto* misses = static_cast<int*>(workspace->alloc_bytes((max_active + 1) * sizeof(int)).data);
+                kernels::gather_recurrent(sources, routing.active, routing.active_count, routing.bounds,
+                    e, p.delivery_layer, routed_cache, misses, p.words[0], p.words[1],
+                    p.stride[0], p.stride[1], selected, counts, stream);
+            } else {
+                const auto words = std::size_t(max_active) * (p.stride[0] + p.stride[1]);
+                auto* stage = static_cast<uint4*>(workspace->alloc_bytes(words * sizeof(uint4)).data);
+                kernels::gather_experts(sources, routing.active, routing.active_count, routing.bounds,
+                    max_active, e, stage, p.words[0], p.words[1], p.stride[0], p.stride[1],
+                    selected, counts, stream);
+            }
+            up_table = selected;
+            down_table = selected + e;
+        }
+        const gguf::MoeTable gate_up{up_table, p.gate_up_row_bytes, 2 * width, hidden,
+                                     p.gate_up_aligned16};
+        const gguf::MoeTable down{down_table, p.down_row_bytes, hidden, width,
+                                  p.down_aligned16};
         auto* middle = static_cast<__nv_bfloat16*>(
             workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
+        const int product_width = vector || p.bf16 ? 2 * width : std::max(2 * width, hidden);
         auto* gu = static_cast<float*>(
-            workspace->alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
+            workspace->alloc_bytes(std::size_t(pairs) * product_width * 4).data);
         if (vector) {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
             void* act2  = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
@@ -2387,13 +2681,24 @@ struct Executor::Impl {
             gguf::MoeOutput out;
             out.weighted = fixed;
             out.weights  = weights;
-            const auto compute = [&](const gguf::MoeRouting& part) {
+            const auto gate_product = [&](const gguf::MoeRouting& part) {
                 gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, act, t,
                                          rows, chunk, stream);
-                situ(gu, pairs, pair_scale, middle, stream);
-                gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
+            };
+            const auto finish_product = [&](const gguf::MoeRouting& part, const std::int32_t* ids_mask = nullptr) {
+                if (fused_experts) {
+                    kernels::situ_rows_q8(gu, pairs, width, pair_scale, config.gate_cap,
+                                          config.up_cap, q8_view(act2, width, pairs).rows, stream, ids_mask);
+                } else {
+                    situ(gu, pairs, pair_scale, middle, stream);
+                    gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
+                }
                 gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
                                          out, chunk, stream);
+            };
+            const auto compute = [&](const gguf::MoeRouting& part, const std::int32_t* ids_mask = nullptr) {
+                gate_product(part);
+                finish_product(part, ids_mask);
             };
             if (call) {
                 // Both stages add to the same exact fixed-point sum, each over its experts of the
@@ -2405,21 +2710,38 @@ struct Executor::Impl {
                     part.active           = set + 1;
                     return part;
                 };
-                CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * width * 4, stream));
-                compute(stage(call->cached_experts));
+                const bool join = joined_experts && !cpu && !c.chunk;
+                const bool masked = sparse_stages && !join && !c.chunk && !cpu;
+                if (!masked) {
+                    CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * width * 4, stream));
+                }
+                const bool replay = expert_graphs && !c.chunk;
+                const auto key = 131072u + 2u * std::uint32_t((t - 1) * visits.size() + visit_id);
+                run_graph(key, [&] {
+                    if (join) { gate_product(stage(call->cached_experts)); }
+                    else { compute(stage(call->cached_experts), masked ? call->cached_ids : nullptr); }
+                }, replay);
                 delivery->await(stream);
-                compute(stage(call->missing_experts));
+                if (!masked || !delivery->all_cached()) {
+                    run_graph(key + 1, [&] {
+                        if (join) {
+                            gate_product(stage(call->missing_experts));
+                            finish_product(routing);
+                        } else { compute(stage(call->missing_experts), masked ? call->missing_ids : nullptr); }
+                    }, replay);
+                }
                 if (call->cpu != nullptr) {
                     kernels::add_fixed(fixed, call->products, call->cpu, std::int64_t(t) * hidden,
                                        stream);
                 }
             } else {
-                compute(routing);
+                const auto key = 131072u + 2u * std::uint32_t((t - 1) * visits.size() + visit_id);
+                run_graph(key, [&] { compute(routing); }, delivery && expert_graphs && !c.chunk);
             }
             ra.fixed = fixed;
             return;
         }
-        if (delivery) { delivery->await(stream); }
+        if (call) { delivery->await(stream); }
         if (p.bf16) {
             auto* rows = static_cast<float*>(
                 workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
@@ -2430,19 +2752,20 @@ struct Executor::Impl {
             ra.top_k       = k;
             return;
         }
-        void* rows_act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
+        const auto activation_bytes = std::max(gguf::moe_matrix_activation_bytes(hidden, pairs),
+                                               gguf::moe_matrix_activation_bytes(width, pairs));
+        void* rows_act = workspace->alloc_bytes(activation_bytes).data;
         gguf::quantize_moe_matrix_activation(p.gate_up_type, c.ffn_bf16, hidden, routing, pairs, k,
                                              rows_act, stream);
         gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, true,
                                  rows_act, gu, stream);
         situ(gu, pairs, pair_scale, middle, stream);
-        void* act2 = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(width, pairs)).data;
-        gguf::quantize_moe_matrix_activation(p.down_type, middle, width, routing, pairs, 1, act2,
+        // Both projections use the same stream. Only middle is live across this boundary.
+        gguf::quantize_moe_matrix_activation(p.down_type, middle, width, routing, pairs, 1, rows_act,
                                              stream);
-        auto* rows = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
-        gguf::moe_matrix_product(p.down_type, down, routing, max_active, pairs, true, act2, rows,
+        gguf::moe_matrix_product(p.down_type, down, routing, max_active, pairs, true, rows_act, gu,
                                  stream);
-        ra.moe_rows    = rows;
+        ra.moe_rows    = gu;
         ra.moe_weights = weights;
         ra.top_k       = k;
     }
@@ -2522,6 +2845,7 @@ struct Executor::Impl {
         if (first + std::uint32_t(t) > options.max_context) {
             throw std::invalid_argument("inkling2 forward: context capacity exceeded");
         }
+        workspace_phase(false);
         back(sequence, first + std::uint32_t(t));
         std::vector<std::int32_t> pos(t), starts;
         for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
@@ -2652,7 +2976,31 @@ struct Executor::Impl {
         c.rows.tokens    = b;
         c.plane          = std::int64_t(b) * hidden;
         c.spark_rows     = b;
+        static const bool sample_visits = [] {
+            const char* value = std::getenv("HEL_INKLING_PROFILE_VISITS");
+            return value && value[0] == '1';
+        }();
+        trace_visits = sample_visits && !capture_target && (++trace_calls % 64 == 0);
+        if (trace_visits && visit_events.empty()) {
+            visit_events.resize(2*visits.size()+1);
+            for (auto& event : visit_events) { CUDA_CHECK(cudaEventCreate(&event)); }
+        }
         run_with_taps(c, {}, 0, spine ? b : 0);
+        if (trace_visits) {
+            mark_visit(2*visits.size());
+            CUDA_CHECK(cudaEventSynchronize(visit_events.back()));
+            float full = 0, sliding = 0, experts = 0;
+            for (std::size_t v = 0; v < visits.size(); ++v) {
+                float attention, moe;
+                CUDA_CHECK(cudaEventElapsedTime(&attention,visit_events[2*v],visit_events[2*v+1]));
+                CUDA_CHECK(cudaEventElapsedTime(&moe,visit_events[2*v+1],visit_events[2*v+2]));
+                (visits[v].full ? full : sliding) += attention;
+                experts += moe;
+            }
+            std::fprintf(stderr, "Inkling visit timings rows=%d pos=%u full=%.3f sliding=%.3f expert_side=%.3f ms\n",
+                         b, positions.front(), full, sliding, experts);
+            trace_visits = false;
+        }
         if (c.q8) {
             head_logits_q8(c.ffn_q, b, b);
         } else {
@@ -2665,8 +3013,8 @@ struct Executor::Impl {
     }
 
     template <typename Body>
-    void run_graph(std::uint32_t key, Body&& body) {
-        if (!options.cuda_graphs) {
+    void run_graph(std::uint32_t key, Body&& body, bool capture = true) {
+        if (!options.cuda_graphs || !capture) {
             body();
             return;
         }
@@ -2702,9 +3050,11 @@ struct Executor::Impl {
             pos[i] = std::int32_t(positions[sequences[i]]);
             seq[i] = std::int32_t(sequences[i]);
         }
+        workspace_phase(true);
         for (int i = 0; i < b; ++i) { back(sequences[i], positions[sequences[i]] + 1); }
         stage(tokens, pos, seq);
-        run_graph(std::uint32_t(b), [&] { decode_body(b, true); });
+        refresh_mapped_experts();
+        run_graph(std::uint32_t(b), [&] { decode_body(b, true); }, capture_target);
         for (int i = 0; i < b; ++i) { positions[sequences[i]] += 1; }
     }
 
@@ -2745,9 +3095,11 @@ struct Executor::Impl {
                 seq[at] = std::int32_t(s);
             }
         }
+        workspace_phase(true);
         for (int j = 0; j < n; ++j) { back(sequences[j], positions[sequences[j]] + row_widths[j]); }
         stage(tokens, pos, seq);
-        run_graph(16 + std::uint32_t(rows), [&] { decode_body(rows, false); });
+        refresh_mapped_experts();
+        run_graph(16 + std::uint32_t(rows), [&] { decode_body(rows, false); }, capture_target);
         verify_widths = std::move(row_widths);
     }
 
@@ -2843,6 +3195,10 @@ struct Executor::Impl {
         if (delivery) {
             delivery->drain();
             delivery->prime(options.expert_profile ? &*options.expert_profile : nullptr);
+            if (options.mapped_misses) {
+                mapped_dirty = true;
+                mapped_counts.fill();
+            }
             std::lock_guard lock(expert_stats_mutex);
             expert_startup_stats = delivery->stats();
         }
@@ -2907,10 +3263,12 @@ struct Executor::Impl {
     }
 
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const {
-        std::uint64_t bytes = sequence_history_bytes();
+        const std::size_t history_rows = std::min<std::uint32_t>(position, kTaps - 1);
+        std::uint64_t bytes = visits.size() * history_rows * std::size_t(slot_floats) * sizeof(float);
         for (const VisitPlan* p : cache_plans()) {
             if (p->full) {
-                bytes += 2 * std::uint64_t(kv_heads) * position * kD * sizeof(__half);
+                bytes += std::uint64_t(kv_heads) * position *
+                         (p->k.position_bytes + p->v.position_bytes);
             } else {
                 for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; }
             }
@@ -2919,13 +3277,29 @@ struct Executor::Impl {
         return bytes + (spine ? spine->image_bytes(position) : 0);
     }
 
+    static constexpr std::uint32_t kImageTile = 2048;
+
+    std::uint64_t shareable_image_bytes(std::uint32_t position) const {
+        std::uint64_t row = 0;
+        for (const VisitPlan* p : cache_plans()) {
+            if (p->full) { row += kv_heads * (p->k.position_bytes + p->v.position_bytes); }
+        }
+        return (position / kImageTile * kImageTile) * row;
+    }
+
     void copy_image(std::uint32_t sequence, std::uint32_t position, std::span<std::byte* const> pages,
-                    std::size_t page_bytes, bool save, bool checkpoint) {
+                    std::size_t page_bytes, bool save, bool checkpoint, std::size_t shared_pages = 0) {
         if (page_bytes == 0 || pages.size() < (image_bytes(position) + page_bytes - 1) / page_bytes) {
             throw std::invalid_argument("inkling2 image: pages do not hold the image");
         }
         std::size_t at = 0;
         const auto copy = [&](std::uint8_t* device, std::size_t bytes) {
+            if (at < shared_pages * page_bytes) {
+                const auto skip = std::min(bytes, shared_pages * page_bytes - at);
+                device += skip;
+                bytes -= skip;
+                at += skip;
+            }
             while (bytes > 0) {
                 const std::size_t in_page = std::min(bytes, page_bytes - at % page_bytes);
                 std::byte* host           = pages[at / page_bytes] + at % page_bytes;
@@ -2939,17 +3313,24 @@ struct Executor::Impl {
                 at += in_page;
             }
         };
-        const std::size_t head_bytes = std::size_t(global_slots) * kD * sizeof(__half);
-        for (const VisitPlan* p : cache_plans()) {
-            if (p->full) {
+        const auto plans = cache_plans();
+        // Completed token tiles of full attention are immutable along one execution branch.
+        // Rings, recurrent histories, and the final partial tile always belong to this checkpoint.
+        for (std::uint32_t t = 0; t < position; t += kImageTile) {
+            const auto length = std::min(kImageTile, position - t);
+            for (const VisitPlan* p : plans) {
+                if (!p->full) { continue; }
                 for (const KvArea* area : {&p->k, &p->v}) {
-                    auto* base = static_cast<std::uint8_t*>(area->p) + sequence * head_bytes * kv_heads;
+                    auto* base = static_cast<std::uint8_t*>(area->p) +
+                                 sequence * area->row_bytes * kv_heads + std::size_t(t) * area->position_bytes;
                     for (int h = 0; h < kv_heads; ++h) {
-                        copy(base + h * head_bytes, std::size_t(position) * kD * sizeof(__half));
+                        copy(base + h * area->row_bytes, std::size_t(length) * area->position_bytes);
                     }
                 }
-                continue;
             }
+        }
+        for (const VisitPlan* p : plans) {
+            if (p->full) { continue; }
             const auto rings = ring_buffers(*p, sequence);
             for (std::size_t i = 0; i < rings.size(); ++i) {
                 std::uint8_t* device =
@@ -2964,16 +3345,26 @@ struct Executor::Impl {
                      sequence * ring_bytes,
                  ring_bytes);
         }
-        const std::size_t bytes = sequence_history_bytes();
-        copy(static_cast<std::uint8_t*>(checkpoint ? history_kept.p : history.p) + sequence * bytes,
-             bytes);
+        // После восстановления откат ниже позиции снимка запрещён. Каждой свёртке
+        // нужны только три предшествующие строки, остальные 29 в кольце перезапишутся.
+        const std::size_t history_rows = std::min<std::uint32_t>(position, kTaps - 1);
+        const std::size_t history_first = (position - history_rows) % kR;
+        const std::size_t first_rows = std::min(history_rows, kR - history_first);
+        const std::size_t row_bytes = std::size_t(slot_floats) * sizeof(float);
+        auto* sequence_history = static_cast<std::uint8_t*>(checkpoint ? history_kept.p : history.p) +
+                                 sequence * sequence_history_bytes();
+        for (std::size_t visit = 0; visit < visits.size(); ++visit) {
+            auto* ring_base = sequence_history + visit * kR * row_bytes;
+            copy(ring_base + history_first * row_bytes, first_rows * row_bytes);
+            copy(ring_base, (history_rows - first_rows) * row_bytes);
+        }
         if (spine) { spine->copy_image(spine->lane(sequence, checkpoint ? 1 : 0), position, copy); }
     }
 
     SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
-                             std::span<std::byte* const> pages, std::size_t page_bytes) {
+                             std::span<std::byte* const> pages, std::size_t page_bytes, std::size_t shared_pages) {
         const std::uint32_t position = at != nullptr ? at->position : positions.at(sequence);
-        copy_image(sequence, position, pages, page_bytes, true, at != nullptr);
+        copy_image(sequence, position, pages, page_bytes, true, at != nullptr, shared_pages);
         return {position};
     }
 
@@ -3022,6 +3413,8 @@ Executor::~Executor() = default;
 
 const ExecutorOptions& Executor::options() const noexcept { return impl_->options; }
 
+bool Executor::target_graphs_enabled() const noexcept { return impl_->capture_target; }
+
 ExecutorMemory Executor::memory() const noexcept {
     return ExecutorMemory{.kv_bytes        = impl_->kv_bytes,
                           .kv_backed_bytes = impl_->kv_backed.load(std::memory_order_relaxed),
@@ -3042,9 +3435,13 @@ std::uint64_t Executor::image_bytes(std::uint32_t position) const {
     return impl_->image_bytes(position);
 }
 
+std::uint64_t Executor::shareable_image_bytes(std::uint32_t position) const {
+    return impl_->shareable_image_bytes(position);
+}
+
 SequenceImage Executor::save_image(std::uint32_t sequence, const SequenceSnapshot* at,
-                                   std::span<std::byte* const> pages, std::size_t page_bytes) {
-    return impl_->save_image(sequence, at, pages, page_bytes);
+                                   std::span<std::byte* const> pages, std::size_t page_bytes, std::size_t shared_pages) {
+    return impl_->save_image(sequence, at, pages, page_bytes, shared_pages);
 }
 
 void Executor::load_image(std::uint32_t sequence, const SequenceImage& image,
@@ -3070,10 +3467,22 @@ void Executor::warm_up() {
 void Executor::check_experts() const {
     if (impl_->delivery) { impl_->delivery->check(); }
 }
+void Executor::publish_mapped_stats() {
+    if (!impl_->options.mapped_misses) { return; }
+    kernels::MappedCounts current;
+    CUDA_CHECK(ninfer::wait_for_stream(impl_->stream));
+    impl_->mapped_counts.copy_to_host(&current, sizeof(current));
+    std::lock_guard lock(impl_->expert_stats_mutex);
+    impl_->published_mapped = current;
+}
 ExpertDeliveryStats Executor::expert_stats() const {
     if (!impl_->delivery) { return {}; }
     std::lock_guard lock(impl_->expert_stats_mutex);
-    return impl_->delivery->stats() - impl_->expert_startup_stats;
+    auto stats = impl_->delivery->stats() - impl_->expert_startup_stats;
+    stats.pairs += impl_->published_mapped.pairs;
+    stats.pair_hits += impl_->published_mapped.hits;
+    stats.copied_bytes += impl_->published_mapped.bytes;
+    return stats;
 }
 ExpertRouteCounts Executor::expert_totals() const {
     return impl_->delivery ? impl_->delivery->totals() : ExpertRouteCounts{};

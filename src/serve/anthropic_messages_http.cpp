@@ -1,9 +1,12 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "serve/http_server.h"
 
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -73,12 +76,18 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
+    const bool report_hel_usage = request.stream && !options_.api_key.empty() &&
+        req.get_header_value_count("x-hel-live-usage") == 1 &&
+        req.get_header_value("x-hel-live-usage") == "1";
     PreparedRequest prepared;
     try {
+        const ninfer::GenerationObservationOptions observation{.phase_timings = report_hel_usage,
+                                                                .live_timings = report_hel_usage};
         prepared            = service->prepare(request.generation,
                                                request.stream ? GenerationConsumerMode::Streaming
                                                               : GenerationConsumerMode::Aggregate,
-                                               {}, [&req] { return client_disconnected(req); });
+                                               observation, [&req] { return client_disconnected(req); },
+                                               conversation_cache(req));
         prepared.model_hold = std::make_shared<ModelRegistry::Lease>(std::move(lease));
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
@@ -153,13 +162,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     try {
         auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
+        bind_stream_stop(req, std::shared_ptr<std::atomic<bool>>(stream, &stream->cancelled));
         auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens,
                                                                  request.hide_thinking);
-
         prepare_sse_response(res);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, service, stream, encoder, lifecycle](std::size_t,
+            [this, service, stream, encoder, lifecycle, report_hel_usage, input_tokens](std::size_t,
                                                         httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
@@ -190,9 +199,24 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 GenerationOutcome outcome;
                 try {
                     StreamSink output;
+                    std::uint32_t cached = 0;
                     output.on_start = [&](const ninfer::GenerationStart& start) {
+                        cached = start.reused_prompt_tokens;
                         render_and_write(transport, [&] { return encoder->start(start); });
                     };
+                    auto last_usage = SseTransport::Clock::time_point::min();
+                    if (report_hel_usage) {
+                        output.on_timing = [&](const ninfer::GenerationTimingObservation& timing) {
+                            const auto now = SseTransport::Clock::now();
+                            if (last_usage != SseTransport::Clock::time_point::min() &&
+                                now - last_usage < std::chrono::milliseconds(500)) { return; }
+                            last_usage = now;
+                            // SSE comments carry request-local counters without adding an Anthropic event.
+                            transport.write(": hel-usage " + std::to_string(input_tokens) + " " +
+                                std::to_string(cached) + " " + std::to_string(timing.generated_tokens) +
+                                " " + std::to_string(timing.generation_elapsed_ns) + "\n\n", now);
+                        };
+                    }
                     output.on_reasoning = [&](const std::string& text) {
                         render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
                     };

@@ -1,3 +1,5 @@
+// Modified in the NInfer Inkling Ada fork.
+
 #include "artifact/materializer.h"
 
 #include "artifact/framing.h"
@@ -878,7 +880,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             checked_add(out.stats_.pinned_bytes, plan.mapped_capacity_bytes, "mapped Host bytes");
     }
     if (out.pinned_) {
-        out.pinned_->pin();
+        out.pinned_->pin(options.map_pinned);
         for (const auto& placement : plan.pinned_objects) {
             const auto& geometry = reader.geometry(placement.object);
             const std::span<std::byte> destination(out.pinned_->data() + placement.offset,

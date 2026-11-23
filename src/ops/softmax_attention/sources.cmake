@@ -1,3 +1,5 @@
+# Modified in the NInfer Inkling Ada fork.
+
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/causal_softmax_attention.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t.cpp"
@@ -238,7 +240,11 @@ if(NINFER_WINDOWS_KERNEL_DLL)
   set(_ninfer_small_t_i8_target ninfer_small_t_i8)
 else()
   set(_ninfer_small_t_i8_target ninfer_ops)
-  target_sources(ninfer_ops PRIVATE ${_ninfer_small_t_i8_sources})
+  if(WIN32 AND HEL_NINFER_SMALL_T_IMPORT)
+    target_link_libraries(ninfer_ops PRIVATE "${HEL_NINFER_SMALL_T_IMPORT}")
+  else()
+    target_sources(ninfer_ops PRIVATE ${_ninfer_small_t_i8_sources})
+  endif()
 endif()
 list(LENGTH NINFER_ARCHITECTURES _ninfer_small_t_architectures)
 set(_ninfer_small_t_libraries "")
