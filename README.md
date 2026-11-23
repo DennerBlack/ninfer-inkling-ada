@@ -26,6 +26,17 @@ The Q4_0 GPU KV allocation was 3,035 MiB. The GPU expert cache held 5,662 MiB, a
 
 </details>
 
+### RTX 4060 Laptop GPU · 8 GB
+
+One text request at a time with Q4_0 KV, staged host experts, and a 2,560-token prefill chunk.
+
+| Context window | Input tokens | Prefill | Generation | First token | Startup VRAM free |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 65,536 | 61,265 | 683.2 tok/s | **17.8 tok/s** | 1m 29.7s | 255 MiB |
+| 131,072 | 124,065 | 453.0 tok/s | **14.3 tok/s** | 4m 34.0s | 297 MiB |
+
+[Laptop benchmark and launch settings](docs/inkling-ada-laptop.md)
+
 ## Quick start
 
 ### 1. Build the server
